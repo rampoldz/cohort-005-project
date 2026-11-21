@@ -35,6 +35,7 @@ export enum RefundStatus {
   Open = "open",
   Approved = "approved",
   Declined = "declined",
+  Withdrawn = "withdrawn",
 }
 
 export enum TeamMemberRole {
@@ -249,6 +250,10 @@ export const refunds = sqliteTable(
       .$defaultFn(() => new Date().toISOString()),
     resolvedAt: text("resolved_at"),
     resolvedByUserId: integer("resolved_by_user_id").references(() => users.id),
+    // An Approved Refund Request with no issued moment is a Pending Refund;
+    // with one, it is an Issued Refund.
+    issuedAt: text("issued_at"),
+    issuedByUserId: integer("issued_by_user_id").references(() => users.id),
   },
   (table) => [index("refunds_purchase_idx").on(table.purchaseId)]
 );
