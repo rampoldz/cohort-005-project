@@ -12,6 +12,8 @@ import {
   canDecideRefundRequests,
   declineRefundRequest,
   listRefundRequests,
+  markRefundIssued,
+  type MarkRefundIssuedRefusalReason,
   type RefundDecisionRefusalReason,
   type RefundRequestDetails,
 } from "~/lib/refund-requests.server";
@@ -20,7 +22,7 @@ import { Button } from "~/components/ui/button";
 import { AlertTriangle, ReceiptText } from "lucide-react";
 
 const refundDecisionActionSchema = z.object({
-  intent: z.enum(["approve", "decline"]),
+  intent: z.enum(["approve", "decline", "mark-issued"]),
   refundRequestId: z.coerce.number().int(),
 });
 
@@ -31,6 +33,13 @@ const DECISION_REFUSAL_STATUS: Record<RefundDecisionRefusalReason, number> = {
   not_admin: 403,
   request_not_found: 404,
   request_not_open: 409,
+};
+
+const ISSUE_REFUSAL_STATUS: Record<MarkRefundIssuedRefusalReason, number> = {
+  not_admin: 403,
+  request_not_found: 404,
+  request_not_approved: 409,
+  refund_already_issued: 409,
 };
 
 /**
@@ -67,11 +76,43 @@ function buildRefundDecisionEmail(refundRequest: RefundRequestDetails) {
   };
 }
 
+/** The message the learner gets when their Refund is issued. */
+function buildRefundIssuedEmail(refundRequest: RefundRequestDetails) {
+  const { learner, course } = refundRequest;
+
+  return {
+    to: learner.email,
+    subject: `Refund issued — ${course.title}`,
+    body: [
+      `Hi ${learner.name},`,
+      "",
+      `Your refund of ${formatPrice(refundRequest.amountRefunded)} for "${course.title}" has been issued.`,
+      "",
+      "The course is no longer in your account, and your progress in it has been erased for good. Your other courses are unchanged.",
+      "",
+      "You can buy the course again, starting from the beginning. That purchase could not be refunded.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
 export function meta() {
   return [
     { title: "Refund Requests — Cadence" },
-    { name: "description", content: "Approve or decline refund requests" },
+    { name: "description", content: "Decide refund requests and mark refunds as issued" },
   ];
+}
+
+/** Approved, with the money not yet confirmed as sent. */
+function isPendingRefund(refundRequest: {
+  status: RefundStatus;
+  issuedAt: string | null;
+}) {
+  return (
+    refundRequest.status === RefundStatus.Approved &&
+    refundRequest.issuedAt === null
+  );
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -94,8 +135,11 @@ export async function loader({ request }: Route.LoaderArgs) {
       .filter((refundRequest) => refundRequest.status === RefundStatus.Open)
       // The team works through them oldest first.
       .reverse(),
+    pendingRefunds: refundRequests.filter(isPendingRefund).reverse(),
     pastRefundRequests: refundRequests.filter(
-      (refundRequest) => refundRequest.status !== RefundStatus.Open
+      (refundRequest) =>
+        refundRequest.status !== RefundStatus.Open &&
+        !isPendingRefund(refundRequest)
     ),
   };
 }
@@ -122,6 +166,26 @@ export async function action({ request }: Route.ActionArgs) {
   }
 
   const { intent, refundRequestId } = parsed.data;
+
+  if (intent === "mark-issued") {
+    const issued = markRefundIssued(refundRequestId, currentUserId);
+
+    if (!issued.issued) {
+      return data(
+        { error: issued.message },
+        { status: ISSUE_REFUSAL_STATUS[issued.reason] }
+      );
+    }
+
+    const email = buildRefundIssuedEmail(issued.refundRequest);
+
+    console.log(
+      `[email] to=${email.to} subject=${email.subject}\n${email.body}`
+    );
+
+    return { success: true, message: "Refund marked as issued." };
+  }
+
   const result =
     intent === "approve"
       ? approveRefundRequest(refundRequestId, currentUserId)
@@ -255,6 +319,63 @@ function OpenRefundRequestRow({
   );
 }
 
+function PendingRefundRow({
+  refundRequest,
+}: {
+  refundRequest: RefundRequestRow;
+}) {
+  const fetcher = useFetcher<typeof action>();
+  const isMarking = fetcher.state !== "idle";
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if ("error" in fetcher.data) {
+      toast.error(fetcher.data.error);
+    } else {
+      toast.success(fetcher.data.message);
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  function markIssued() {
+    const confirmed = confirm(
+      `Mark the refund of ${formatPrice(refundRequest.amountRefunded)} to ${refundRequest.learner.name} as issued?\n\n` +
+        `This can't be undone. ${refundRequest.learner.name} loses "${refundRequest.course.title}" and their progress in it is erased for good.`
+    );
+    if (!confirmed) return;
+
+    fetcher.submit(
+      { intent: "mark-issued", refundRequestId: String(refundRequest.id) },
+      { method: "post" }
+    );
+  }
+
+  return (
+    <tr className="border-b border-border last:border-0">
+      <LearnerCell refundRequest={refundRequest} />
+      <CourseCell refundRequest={refundRequest} />
+      <td className="px-4 py-3 align-top text-sm">
+        {formatPrice(refundRequest.amountRefunded)}
+      </td>
+      <td className="px-4 py-3 align-top text-sm text-muted-foreground">
+        {refundRequest.resolvedBy && refundRequest.resolvedAt
+          ? `${refundRequest.resolvedBy.name}, ${new Date(refundRequest.resolvedAt).toLocaleDateString()}`
+          : "—"}
+      </td>
+      <td className="px-4 py-3 align-top">
+        <Button
+          variant="destructive"
+          size="sm"
+          className="h-7 text-xs"
+          onClick={markIssued}
+          disabled={isMarking}
+        >
+          Mark as issued
+        </Button>
+      </td>
+    </tr>
+  );
+}
+
 function outcomeOf(refundRequest: RefundRequestRow): string {
   switch (refundRequest.status) {
     case RefundStatus.Approved:
@@ -301,7 +422,8 @@ function PastRefundRequestRow({
 export default function AdminRefundRequests({
   loaderData,
 }: Route.ComponentProps) {
-  const { openRefundRequests, pastRefundRequests } = loaderData;
+  const { openRefundRequests, pendingRefunds, pastRefundRequests } =
+    loaderData;
 
   return (
     <div className="mx-auto max-w-7xl p-6 lg:p-8">
@@ -316,7 +438,8 @@ export default function AdminRefundRequests({
       <div className="mb-8">
         <h1 className="text-3xl font-bold">Refund Requests</h1>
         <p className="mt-1 text-muted-foreground">
-          Approve or decline the refund requests learners have raised
+          Approve or decline the refund requests learners have raised, and
+          mark refunds as issued once the money is sent
         </p>
       </div>
 
@@ -360,6 +483,48 @@ export default function AdminRefundRequests({
             </div>
           </CardContent>
         </Card>
+      )}
+
+      <h2 className="mb-3 mt-10 text-lg font-semibold">
+        Pending refunds ({pendingRefunds.length})
+      </h2>
+      {pendingRefunds.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          No pending refunds. Every approved refund has been issued.
+        </p>
+      ) : (
+        <>
+          <p className="mb-3 text-sm text-muted-foreground">
+            Approved, with the money not yet confirmed as sent. Marking a refund
+            as issued ends the learner's access to the course and erases their
+            progress in it. It can't be undone.
+          </p>
+          <Card>
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border bg-muted/50">
+                      <th className={HEADER_CELL}>Learner</th>
+                      <th className={HEADER_CELL}>Course</th>
+                      <th className={HEADER_CELL}>Refund</th>
+                      <th className={HEADER_CELL}>Approved by</th>
+                      <th className={HEADER_CELL}>Money sent?</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pendingRefunds.map((refundRequest) => (
+                      <PendingRefundRow
+                        key={refundRequest.id}
+                        refundRequest={refundRequest}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        </>
       )}
 
       <h2 className="mb-3 mt-10 text-lg font-semibold">

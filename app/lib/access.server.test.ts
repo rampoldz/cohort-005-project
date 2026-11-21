@@ -27,6 +27,7 @@ import { getAccess, requireContentAccess } from "./access.server";
 import {
   approveRefundRequest,
   declineRefundRequest,
+  markRefundIssued,
   raiseRefundRequest,
 } from "./refund-requests.server";
 
@@ -269,6 +270,84 @@ describe("getAccess", () => {
       const access = await getAccess(makeRequest(), world.course.id);
 
       expect(access).toMatchObject({ locked: true, canViewContent: false });
+    });
+
+    describe("and the Refund is marked as issued", () => {
+      beforeEach(() => {
+        approveRefundRequest(refundRequestId, adminId);
+      });
+
+      it("leaves the learner unenrolled: the course is not viewable and not Locked", async () => {
+        markRefundIssued(refundRequestId, adminId);
+        signInAs(world.user.id);
+
+        const access = await getAccess(makeRequest(), world.course.id);
+
+        expect(access).toMatchObject({
+          enrolled: false,
+          locked: false,
+          canViewContent: false,
+        });
+      });
+
+      it("refuses the learner's Progress writes as it would anyone not enrolled", async () => {
+        markRefundIssued(refundRequestId, adminId);
+        signInAs(world.user.id);
+
+        await expect(
+          requireContentAccess(makeRequest(), world.course.id)
+        ).rejects.toMatchObject({
+          data: "You must be enrolled in this course.",
+          init: { status: 403 },
+        });
+      });
+
+      it("leaves the learner's other courses viewable", async () => {
+        const other = addCourse(world, "other-course");
+        buyCourse(world.user.id, other.id);
+        markRefundIssued(refundRequestId, adminId);
+        signInAs(world.user.id);
+
+        const access = await getAccess(makeRequest(), other.id);
+
+        expect(access).toMatchObject({
+          enrolled: true,
+          locked: false,
+          canViewContent: true,
+        });
+      });
+
+      it("leaves another learner of the same course enrolled and able to view it", async () => {
+        const otherLearner = testDb
+          .insert(schema.users)
+          .values({
+            name: "Other Learner",
+            email: "other@example.com",
+            role: schema.UserRole.Student,
+          })
+          .returning()
+          .get();
+        buyCourse(otherLearner.id, world.course.id);
+        markRefundIssued(refundRequestId, adminId);
+        signInAs(otherLearner.id);
+
+        const access = await getAccess(makeRequest(), world.course.id);
+
+        expect(access).toMatchObject({ enrolled: true, canViewContent: true });
+      });
+
+      it("keeps the course Locked and the learner enrolled when an instructor tries to mark it", async () => {
+        markRefundIssued(refundRequestId, world.instructor.id);
+        signInAs(world.user.id);
+
+        const access = await getAccess(makeRequest(), world.course.id);
+
+        expect(access).toMatchObject({
+          enrolled: true,
+          locked: true,
+          canViewContent: false,
+        });
+      });
     });
   });
 

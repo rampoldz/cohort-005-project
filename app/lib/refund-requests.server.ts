@@ -1,12 +1,18 @@
 import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
+  comments,
   coupons,
+  courseRatings,
   courses,
+  enrollments,
   lessonProgress,
   lessons,
   modules,
   purchases,
+  quizAnswers,
+  quizAttempts,
+  quizzes,
   refunds,
   users,
   videoWatchEvents,
@@ -18,7 +24,8 @@ import {
 // ─── Refund Requests ───
 // One place that holds every rule about a learner getting their money back:
 // whether a purchase can be refunded (and why not), raising the Refund
-// Request, the team approving or declining it, and whether that has the
+// Request, the team approving or declining it, marking the Refund as issued
+// (which ends access and erases Progress), and whether any of that has the
 // course Locked. Routes and pages call this and hold no refund rules of their
 // own.
 // Vocabulary is in GLOSSARY.md; the decisions are in docs/adr/0001.
@@ -39,6 +46,7 @@ export type RefundRequest = typeof refunds.$inferSelect;
 export type RefundRefusalReason =
   | "no_purchase"
   | "request_undecided"
+  | "already_refunded"
   | "team_seat_claimed"
   | "window_closed"
   | "watched_too_much"
@@ -49,6 +57,7 @@ const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
   no_purchase: "You have not bought this course.",
   request_undecided:
     "You already have a refund request on this purchase that is open or approved.",
+  already_refunded: "This purchase has already been refunded.",
   team_seat_claimed: "A claimed team seat cannot be refunded.",
   window_closed: `The ${REFUND_WINDOW_DAYS}-day window has closed.`,
   watched_too_much:
@@ -158,6 +167,23 @@ function hasUndecidedRefundRequest(purchaseId: number) {
   return !!undecided;
 }
 
+// One Refund per purchase: once its Refund is issued, the purchase is spent.
+function hasIssuedRefund(purchaseId: number) {
+  const issued = db
+    .select({ id: refunds.id })
+    .from(refunds)
+    .where(
+      and(
+        eq(refunds.purchaseId, purchaseId),
+        eq(refunds.status, RefundStatus.Approved),
+        isNotNull(refunds.issuedAt)
+      )
+    )
+    .get();
+
+  return !!issued;
+}
+
 // A seat that came out of a team licence, and has been claimed, belongs to
 // the team — the buyer cannot hand it back on their own.
 function hasClaimedTeamSeat(purchaseId: number) {
@@ -252,6 +278,10 @@ export function getRefundEligibility(
 
   if (hasUndecidedRefundRequest(purchase.id)) {
     return { eligible: false, ...refusal("request_undecided") };
+  }
+
+  if (hasIssuedRefund(purchase.id)) {
+    return { eligible: false, ...refusal("already_refunded") };
   }
 
   if (hasClaimedTeamSeat(purchase.id)) {
@@ -497,6 +527,177 @@ export function approveRefundRequest(
     adminUserId,
     RefundStatus.Approved
   );
+}
+
+// ─── Issuing the Refund ───
+// Marking a Pending Refund as issued is the moment the learner stops having
+// the course (ADR 0001). It can't be undone, and support can't restore what it
+// erases.
+
+/** Why a Refund can't be marked as issued. */
+export type MarkRefundIssuedRefusalReason =
+  | "not_admin"
+  | "request_not_found"
+  | "request_not_approved"
+  | "refund_already_issued";
+
+const ISSUE_REFUSAL_MESSAGES: Record<MarkRefundIssuedRefusalReason, string> = {
+  not_admin: "Only admins can mark a refund as issued.",
+  request_not_found: "That refund request does not exist.",
+  request_not_approved:
+    "Only an approved refund request can have its refund marked as issued.",
+  refund_already_issued: "That refund has already been marked as issued.",
+};
+
+export type MarkRefundIssuedResult =
+  | { issued: true; refundRequest: RefundRequestDetails }
+  | {
+      issued: false;
+      reason: MarkRefundIssuedRefusalReason;
+      /** The reason in words the admin can be shown. */
+      message: string;
+    };
+
+function issueRefusal(
+  reason: MarkRefundIssuedRefusalReason
+): MarkRefundIssuedResult {
+  return { issued: false, reason, message: ISSUE_REFUSAL_MESSAGES[reason] };
+}
+
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+// Progress is everything the learner built up in this one course (see
+// GLOSSARY.md). All of it is deleted outright except comments, which use the
+// existing deleted-comment state with their content removed, so other
+// learners' replies to them stay readable.
+function eraseProgress(tx: Transaction, userId: number, courseId: number) {
+  tx.delete(courseRatings)
+    .where(
+      and(eq(courseRatings.userId, userId), eq(courseRatings.courseId, courseId))
+    )
+    .run();
+
+  const lessonIds = tx
+    .select({ id: lessons.id })
+    .from(lessons)
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .where(eq(modules.courseId, courseId))
+    .all()
+    .map((row) => row.id);
+  if (lessonIds.length === 0) return;
+
+  tx.delete(lessonProgress)
+    .where(
+      and(
+        eq(lessonProgress.userId, userId),
+        inArray(lessonProgress.lessonId, lessonIds)
+      )
+    )
+    .run();
+
+  tx.delete(videoWatchEvents)
+    .where(
+      and(
+        eq(videoWatchEvents.userId, userId),
+        inArray(videoWatchEvents.lessonId, lessonIds)
+      )
+    )
+    .run();
+
+  const attemptIds = tx
+    .select({ id: quizAttempts.id })
+    .from(quizAttempts)
+    .innerJoin(quizzes, eq(quizAttempts.quizId, quizzes.id))
+    .where(
+      and(eq(quizAttempts.userId, userId), inArray(quizzes.lessonId, lessonIds))
+    )
+    .all()
+    .map((row) => row.id);
+  if (attemptIds.length > 0) {
+    tx.delete(quizAnswers)
+      .where(inArray(quizAnswers.attemptId, attemptIds))
+      .run();
+    tx.delete(quizAttempts).where(inArray(quizAttempts.id, attemptIds)).run();
+  }
+
+  // A comment the learner had already deleted keeps the moment they did.
+  const now = new Date().toISOString();
+  tx.update(comments)
+    .set({
+      body: "",
+      editedAt: null,
+      deletedAt: sql`coalesce(${comments.deletedAt}, ${now})`,
+    })
+    .where(
+      and(eq(comments.userId, userId), inArray(comments.lessonId, lessonIds))
+    )
+    .run();
+}
+
+/**
+ * An admin confirms the money of a Pending Refund has been sent, making it an
+ * Issued Refund. In one transaction this records the moment and the admin,
+ * ends the learner's enrollment in the course, and erases their Progress in
+ * it — all of it or none of it. Nothing in any other course is touched, and
+ * the purchase and the Refund Request stay as the record.
+ *
+ * Refused unless the Refund Request is approved and its Refund not yet
+ * issued. Unlike a refusal, a failure partway through throws, and leaves
+ * access and Progress as they were.
+ */
+export function markRefundIssued(
+  refundRequestId: number,
+  adminUserId: number
+): MarkRefundIssuedResult {
+  if (!canDecideRefundRequests(adminUserId)) {
+    return issueRefusal("not_admin");
+  }
+
+  const current = getRefundRequestDetails(refundRequestId);
+  if (!current) return issueRefusal("request_not_found");
+  if (current.status !== RefundStatus.Approved) {
+    return issueRefusal("request_not_approved");
+  }
+
+  const issued = db.transaction((tx) => {
+    // Pending is checked in the update itself, so two admins marking it at
+    // once can't both succeed.
+    const marked = tx
+      .update(refunds)
+      .set({
+        issuedAt: new Date().toISOString(),
+        issuedByUserId: adminUserId,
+      })
+      .where(
+        and(
+          eq(refunds.id, refundRequestId),
+          eq(refunds.status, RefundStatus.Approved),
+          isNull(refunds.issuedAt)
+        )
+      )
+      .returning({ id: refunds.id })
+      .get();
+    if (!marked) return false;
+
+    tx.delete(enrollments)
+      .where(
+        and(
+          eq(enrollments.userId, current.learner.id),
+          eq(enrollments.courseId, current.course.id)
+        )
+      )
+      .run();
+    eraseProgress(tx, current.learner.id, current.course.id);
+
+    return true;
+  });
+
+  if (!issued) return issueRefusal("refund_already_issued");
+
+  return {
+    issued: true,
+    refundRequest: getRefundRequestDetails(refundRequestId)!,
+  };
 }
 
 /**

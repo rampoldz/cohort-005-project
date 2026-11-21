@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createTestDb, seedBaseData } from "~/test/setup";
+import { sql } from "drizzle-orm";
 import * as schema from "~/db/schema";
 
 // The module under test talks to `~/db`. Point that at a fresh in-memory
@@ -18,6 +19,7 @@ import {
   listRefundRequests,
   getLockingRefundRequest,
   getRefundEligibility,
+  markRefundIssued,
   isCourseLocked,
   raiseRefundRequest,
 } from "./refund-requests.server";
@@ -658,6 +660,607 @@ describe("Refund Request module", () => {
         expect(listRefundRequests()).toMatchObject([
           { lessonsCompleted: 3, secondsWatched: 600 },
         ]);
+      });
+    });
+  });
+
+  describe("marking a Refund as issued", () => {
+    function addUser(name: string, role = schema.UserRole.Student) {
+      return testDb
+        .insert(schema.users)
+        .values({
+          name,
+          email: `${name.toLowerCase().replace(/\s+/g, ".")}@example.com`,
+          role,
+        })
+        .returning()
+        .get();
+    }
+
+    function addAdmin() {
+      return addUser("Ada Admin", schema.UserRole.Admin);
+    }
+
+    /** The learner buys the course and raises a Refund Request on it. */
+    function raiseOpenRequest() {
+      buyCourse(world);
+      const result = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        true
+      );
+      if (!result.raised) throw new Error("The Refund Request was refused");
+      return result.refundRequest;
+    }
+
+    /** A Pending Refund: the learner's Refund Request, approved by the admin. */
+    function approveOpenRequest(adminId: number) {
+      const refundRequest = raiseOpenRequest();
+      const approved = approveRefundRequest(refundRequest.id, adminId);
+      if (!approved.decided) throw new Error("The approval was refused");
+      return refundRequest;
+    }
+
+    /** A second course by the same instructor, with two lessons. */
+    function addOtherCourse() {
+      const course = testDb
+        .insert(schema.courses)
+        .values({
+          title: "Other Course",
+          slug: "other-course",
+          description: "Another course",
+          salesCopy: "Sales copy",
+          instructorId: world.instructor.id,
+          categoryId: world.category.id,
+          status: schema.CourseStatus.Published,
+        })
+        .returning()
+        .get();
+      const courseModule = testDb
+        .insert(schema.modules)
+        .values({ courseId: course.id, title: "Module 1", position: 1 })
+        .returning()
+        .get();
+      const lessonIds = [1, 2].map(
+        (position) =>
+          testDb
+            .insert(schema.lessons)
+            .values({
+              moduleId: courseModule.id,
+              title: `Other lesson ${position}`,
+              position,
+            })
+            .returning()
+            .get().id
+      );
+      return { course, lessonIds };
+    }
+
+    function enroll(userId: number, courseId: number) {
+      testDb.insert(schema.enrollments).values({ userId, courseId }).run();
+    }
+
+    function startLesson(userId: number, lessonId: number, completed = false) {
+      testDb
+        .insert(schema.lessonProgress)
+        .values({
+          userId,
+          lessonId,
+          status: completed
+            ? schema.LessonProgressStatus.Completed
+            : schema.LessonProgressStatus.InProgress,
+          completedAt: completed ? daysAgo(1) : null,
+        })
+        .run();
+    }
+
+    function watchLesson(userId: number, lessonId: number) {
+      testDb
+        .insert(schema.videoWatchEvents)
+        .values({ userId, lessonId, eventType: "progress", positionSeconds: 90 })
+        .run();
+    }
+
+    function addQuiz(lessonId: number) {
+      const quiz = testDb
+        .insert(schema.quizzes)
+        .values({ lessonId, title: "Quiz", passingScore: 0.5 })
+        .returning()
+        .get();
+      const question = testDb
+        .insert(schema.quizQuestions)
+        .values({
+          quizId: quiz.id,
+          questionText: "Is this a question?",
+          questionType: schema.QuestionType.TrueFalse,
+          position: 1,
+        })
+        .returning()
+        .get();
+      const option = testDb
+        .insert(schema.quizOptions)
+        .values({ questionId: question.id, optionText: "True", isCorrect: true })
+        .returning()
+        .get();
+      return { quiz, question, option };
+    }
+
+    function attemptQuiz(userId: number, quiz: ReturnType<typeof addQuiz>) {
+      const attempt = testDb
+        .insert(schema.quizAttempts)
+        .values({ userId, quizId: quiz.quiz.id, score: 1, passed: true })
+        .returning()
+        .get();
+      testDb
+        .insert(schema.quizAnswers)
+        .values({
+          attemptId: attempt.id,
+          questionId: quiz.question.id,
+          selectedOptionId: quiz.option.id,
+        })
+        .run();
+    }
+
+    function rate(userId: number, courseId: number, rating: number) {
+      testDb
+        .insert(schema.courseRatings)
+        .values({ userId, courseId, rating })
+        .run();
+    }
+
+    function comment(
+      userId: number,
+      lessonId: number,
+      body: string,
+      parentId: number | null = null
+    ) {
+      return testDb
+        .insert(schema.comments)
+        .values({ userId, lessonId, body, parentId })
+        .returning()
+        .get();
+    }
+
+    function getComment(commentId: number) {
+      return testDb
+        .select()
+        .from(schema.comments)
+        .all()
+        .find((row) => row.id === commentId)!;
+    }
+
+    function ratingsOf(courseId: number) {
+      return testDb
+        .select()
+        .from(schema.courseRatings)
+        .all()
+        .filter((row) => row.courseId === courseId)
+        .map((row) => row.rating);
+    }
+
+    // Nothing in the module's interface reports quiz attempts, ratings or
+    // enrollment, so what a learner has in a course is counted from the
+    // tables. Comments are left out: they are never removed, only shown as
+    // deleted.
+    function holdingsOf(userId: number, courseId: number, lessonIds: number[]) {
+      const quizIds = testDb
+        .select()
+        .from(schema.quizzes)
+        .all()
+        .filter((quiz) => lessonIds.includes(quiz.lessonId))
+        .map((quiz) => quiz.id);
+      const attemptIds = testDb
+        .select()
+        .from(schema.quizAttempts)
+        .all()
+        .filter(
+          (attempt) =>
+            attempt.userId === userId && quizIds.includes(attempt.quizId)
+        )
+        .map((attempt) => attempt.id);
+
+      return {
+        enrolled: testDb
+          .select()
+          .from(schema.enrollments)
+          .all()
+          .some((row) => row.userId === userId && row.courseId === courseId),
+        lessonProgress: testDb
+          .select()
+          .from(schema.lessonProgress)
+          .all()
+          .filter(
+            (row) => row.userId === userId && lessonIds.includes(row.lessonId)
+          ).length,
+        watchEvents: testDb
+          .select()
+          .from(schema.videoWatchEvents)
+          .all()
+          .filter(
+            (row) => row.userId === userId && lessonIds.includes(row.lessonId)
+          ).length,
+        quizAttempts: attemptIds.length,
+        quizAnswers: testDb
+          .select()
+          .from(schema.quizAnswers)
+          .all()
+          .filter((row) => attemptIds.includes(row.attemptId)).length,
+        ratings: testDb
+          .select()
+          .from(schema.courseRatings)
+          .all()
+          .filter((row) => row.userId === userId && row.courseId === courseId)
+          .length,
+      };
+    }
+
+    const NOTHING = {
+      enrolled: false,
+      lessonProgress: 0,
+      watchEvents: 0,
+      quizAttempts: 0,
+      quizAnswers: 0,
+      ratings: 0,
+    };
+
+    /** Gives a learner one of every kind of Progress in a course. */
+    function buildProgress(
+      userId: number,
+      courseId: number,
+      lessonIds: number[],
+      quiz: ReturnType<typeof addQuiz>
+    ) {
+      startLesson(userId, lessonIds[0], true);
+      startLesson(userId, lessonIds[1]);
+      watchLesson(userId, lessonIds[0]);
+      attemptQuiz(userId, quiz);
+      rate(userId, courseId, 4);
+    }
+
+    const ONE_OF_EACH = {
+      enrolled: true,
+      lessonProgress: 2,
+      watchEvents: 1,
+      quizAttempts: 1,
+      quizAnswers: 1,
+      ratings: 1,
+    };
+
+    it("makes it an Issued Refund, recording the admin and the moment", () => {
+      const admin = addAdmin();
+      const refundRequest = approveOpenRequest(admin.id);
+
+      const result = markRefundIssued(refundRequest.id, admin.id);
+
+      expect(result).toMatchObject({
+        issued: true,
+        refundRequest: {
+          id: refundRequest.id,
+          status: schema.RefundStatus.Approved,
+          amountRefunded: 7900,
+          issuedAt: NOW.toISOString(),
+          issuedByUserId: admin.id,
+          learner: { id: world.user.id },
+          course: { id: world.course.id },
+        },
+      });
+    });
+
+    it("keeps the purchase and the Refund Request as the record", () => {
+      const admin = addAdmin();
+      const refundRequest = approveOpenRequest(admin.id);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(listRefundRequests()).toMatchObject([
+        {
+          id: refundRequest.id,
+          amountPaid: 7900,
+          reason: REASON,
+          issuedAt: NOW.toISOString(),
+        },
+      ]);
+    });
+
+    it("ends the learner's enrollment and leaves the course not Locked", () => {
+      const admin = addAdmin();
+      const refundRequest = approveOpenRequest(admin.id);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+      expect(
+        holdingsOf(world.user.id, world.course.id, world.lessonIds).enrolled
+      ).toBe(false);
+    });
+
+    it("erases the learner's lesson progress, quiz attempts and answers, watch events and rating in the course", () => {
+      const admin = addAdmin();
+      const quiz = addQuiz(world.lessonIds[0]);
+      const refundRequest = approveOpenRequest(admin.id);
+      buildProgress(world.user.id, world.course.id, world.lessonIds, quiz);
+      expect(
+        holdingsOf(world.user.id, world.course.id, world.lessonIds)
+      ).toEqual(ONE_OF_EACH);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(
+        holdingsOf(world.user.id, world.course.id, world.lessonIds)
+      ).toEqual(NOTHING);
+      expect(listRefundRequests()).toMatchObject([
+        { lessonsCompleted: 0, secondsWatched: 0 },
+      ]);
+    });
+
+    it("stops the learner's rating counting toward the course's rating", () => {
+      const admin = addAdmin();
+      const other = addUser("Olga Other");
+      const refundRequest = approveOpenRequest(admin.id);
+      rate(world.user.id, world.course.id, 1);
+      rate(other.id, world.course.id, 5);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(ratingsOf(world.course.id)).toEqual([5]);
+    });
+
+    it("shows the learner's comments as deleted with their content removed, and keeps other learners' replies", () => {
+      const admin = addAdmin();
+      const other = addUser("Olga Other");
+      const refundRequest = approveOpenRequest(admin.id);
+      const question = comment(
+        world.user.id,
+        world.lessonIds[0],
+        "Why does this lesson skip generics?"
+      );
+      const reply = comment(
+        other.id,
+        world.lessonIds[0],
+        "They come back in module 3.",
+        question.id
+      );
+      const othersQuestion = comment(
+        other.id,
+        world.lessonIds[1],
+        "Is there a transcript?"
+      );
+      const learnersReply = comment(
+        world.user.id,
+        world.lessonIds[1],
+        "Yes, under the video.",
+        othersQuestion.id
+      );
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(getComment(question.id)).toMatchObject({
+        body: "",
+        deletedAt: NOW.toISOString(),
+      });
+      expect(getComment(learnersReply.id)).toMatchObject({
+        body: "",
+        deletedAt: NOW.toISOString(),
+      });
+      expect(getComment(reply.id)).toMatchObject({
+        body: "They come back in module 3.",
+        parentId: question.id,
+        deletedAt: null,
+      });
+      expect(getComment(othersQuestion.id)).toMatchObject({
+        body: "Is there a transcript?",
+        deletedAt: null,
+      });
+    });
+
+    it("removes the content of a comment the learner had already deleted", () => {
+      const admin = addAdmin();
+      const refundRequest = approveOpenRequest(admin.id);
+      const deleted = testDb
+        .insert(schema.comments)
+        .values({
+          userId: world.user.id,
+          lessonId: world.lessonIds[0],
+          body: "Something I took back.",
+          deletedAt: daysAgo(2),
+        })
+        .returning()
+        .get();
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(getComment(deleted.id)).toMatchObject({
+        body: "",
+        deletedAt: daysAgo(2),
+      });
+    });
+
+    it("leaves the learner's enrollment and Progress in every other course unchanged", () => {
+      const admin = addAdmin();
+      const other = addOtherCourse();
+      const otherQuiz = addQuiz(other.lessonIds[0]);
+      enroll(world.user.id, other.course.id);
+      buildProgress(world.user.id, other.course.id, other.lessonIds, otherQuiz);
+      const otherComment = comment(
+        world.user.id,
+        other.lessonIds[0],
+        "Loving this one."
+      );
+      const refundRequest = approveOpenRequest(admin.id);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(
+        holdingsOf(world.user.id, other.course.id, other.lessonIds)
+      ).toEqual(ONE_OF_EACH);
+      expect(getComment(otherComment.id)).toMatchObject({
+        body: "Loving this one.",
+        deletedAt: null,
+      });
+    });
+
+    it("leaves another learner's enrollment and Progress in the same course unchanged", () => {
+      const admin = addAdmin();
+      const other = addUser("Olga Other");
+      const quiz = addQuiz(world.lessonIds[0]);
+      enroll(other.id, world.course.id);
+      buildProgress(other.id, world.course.id, world.lessonIds, quiz);
+      const refundRequest = approveOpenRequest(admin.id);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(holdingsOf(other.id, world.course.id, world.lessonIds)).toEqual(
+        ONE_OF_EACH
+      );
+    });
+
+    it("leaves no room for another Refund Request on the refunded purchase", () => {
+      const admin = addAdmin();
+      const refundRequest = approveOpenRequest(admin.id);
+
+      markRefundIssued(refundRequest.id, admin.id);
+
+      expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
+        eligible: false,
+        reason: "already_refunded",
+        message: "This purchase has already been refunded.",
+      });
+      expect(
+        raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+      ).toMatchObject({ raised: false, reason: "already_refunded" });
+    });
+
+    // One failure for each step of the erase, wherever in the order it falls.
+    it.each([
+      ["ending the enrollment", "DELETE ON enrollments"],
+      ["erasing lesson progress", "DELETE ON lesson_progress"],
+      ["erasing quiz answers", "DELETE ON quiz_answers"],
+      ["erasing quiz attempts", "DELETE ON quiz_attempts"],
+      ["erasing watch events", "DELETE ON video_watch_events"],
+      ["erasing the rating", "DELETE ON course_ratings"],
+      ["deleting comments", "UPDATE ON comments"],
+    ])(
+      "leaves access and Progress as they were when %s fails",
+      (_step, failingWrite) => {
+        const admin = addAdmin();
+        const quiz = addQuiz(world.lessonIds[0]);
+        const refundRequest = approveOpenRequest(admin.id);
+        buildProgress(world.user.id, world.course.id, world.lessonIds, quiz);
+        const question = comment(
+          world.user.id,
+          world.lessonIds[0],
+          "Why does this lesson skip generics?"
+        );
+        testDb.run(
+          sql.raw(
+            `CREATE TRIGGER fail_partway BEFORE ${failingWrite} BEGIN SELECT RAISE(ABORT, 'disk full'); END`
+          )
+        );
+
+        expect(() => markRefundIssued(refundRequest.id, admin.id)).toThrow(
+          "disk full"
+        );
+
+        expect(
+          holdingsOf(world.user.id, world.course.id, world.lessonIds)
+        ).toEqual(ONE_OF_EACH);
+        expect(getComment(question.id)).toMatchObject({
+          body: "Why does this lesson skip generics?",
+          deletedAt: null,
+        });
+        // Still a Pending Refund, so the course is still Locked.
+        expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+        expect(listRefundRequests()).toMatchObject([
+          { issuedAt: null, issuedByUserId: null, lessonsCompleted: 1 },
+        ]);
+      }
+    );
+
+    it("is refused for a Refund that is already issued", () => {
+      const admin = addAdmin();
+      const laterAdmin = addUser("Lena Later", schema.UserRole.Admin);
+      const refundRequest = approveOpenRequest(admin.id);
+      markRefundIssued(refundRequest.id, admin.id);
+      vi.setSystemTime(new Date(NOW.getTime() + 60_000));
+
+      const again = markRefundIssued(refundRequest.id, laterAdmin.id);
+
+      expect(again).toEqual({
+        issued: false,
+        reason: "refund_already_issued",
+        message: "That refund has already been marked as issued.",
+      });
+      // The record still shows who issued it first, and when.
+      expect(listRefundRequests()).toMatchObject([
+        { issuedAt: NOW.toISOString(), issuedByUserId: admin.id },
+      ]);
+    });
+
+    it("is refused for an Open Refund Request, which keeps its Progress", () => {
+      const admin = addAdmin();
+      const refundRequest = raiseOpenRequest();
+      completeLessons(world, 3);
+
+      const result = markRefundIssued(refundRequest.id, admin.id);
+
+      expect(result).toEqual({
+        issued: false,
+        reason: "request_not_approved",
+        message:
+          "Only an approved refund request can have its refund marked as issued.",
+      });
+      expect(listRefundRequests()).toMatchObject([
+        {
+          status: schema.RefundStatus.Open,
+          issuedAt: null,
+          lessonsCompleted: 3,
+        },
+      ]);
+      expect(
+        holdingsOf(world.user.id, world.course.id, world.lessonIds).enrolled
+      ).toBe(true);
+    });
+
+    it("is refused for a Declined Refund Request", () => {
+      const admin = addAdmin();
+      const refundRequest = raiseOpenRequest();
+      declineRefundRequest(refundRequest.id, admin.id);
+
+      expect(markRefundIssued(refundRequest.id, admin.id)).toMatchObject({
+        issued: false,
+        reason: "request_not_approved",
+      });
+      expect(
+        holdingsOf(world.user.id, world.course.id, world.lessonIds).enrolled
+      ).toBe(true);
+    });
+
+    it("is refused to the course's instructor and to the learner, and nothing is erased", () => {
+      const admin = addAdmin();
+      const refundRequest = approveOpenRequest(admin.id);
+      completeLessons(world, 3);
+
+      for (const userId of [world.instructor.id, world.user.id]) {
+        expect(markRefundIssued(refundRequest.id, userId)).toEqual({
+          issued: false,
+          reason: "not_admin",
+          message: "Only admins can mark a refund as issued.",
+        });
+      }
+      expect(listRefundRequests()).toMatchObject([
+        { issuedAt: null, lessonsCompleted: 3 },
+      ]);
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+    });
+
+    it("is refused for a Refund Request that doesn't exist", () => {
+      const admin = addAdmin();
+
+      expect(markRefundIssued(999, admin.id)).toEqual({
+        issued: false,
+        reason: "request_not_found",
+        message: "That refund request does not exist.",
       });
     });
   });

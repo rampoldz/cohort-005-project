@@ -32,6 +32,7 @@ const refundActionSchema = z.object({
 const REFUSAL_STATUS: Record<RefundRefusalReason, number> = {
   no_purchase: 403,
   request_undecided: 409,
+  already_refunded: 409,
   team_seat_claimed: 403,
   window_closed: 403,
   watched_too_much: 403,
