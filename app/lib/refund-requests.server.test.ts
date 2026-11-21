@@ -19,6 +19,7 @@ import {
   listRefundRequests,
   getLockingRefundRequest,
   getRefundEligibility,
+  isNextPurchaseFinal,
   markRefundIssued,
   isCourseLocked,
   listLearnerRefundRequests,
@@ -1268,6 +1269,104 @@ describe("Refund Request module", () => {
         issued: false,
         reason: "request_not_found",
         message: "That refund request does not exist.",
+      });
+    });
+
+    describe("buying the course again after an Issued Refund", () => {
+      /** The learner's first purchase, refunded all the way to issued. */
+      function refundFirstPurchase() {
+        const admin = addAdmin();
+        const refundRequest = approveOpenRequest(admin.id);
+        const issued = markRefundIssued(refundRequest.id, admin.id);
+        if (!issued.issued) throw new Error("Marking as issued was refused");
+        return admin;
+      }
+
+      it("tells a first-time buyer their purchase is not a Final Purchase", () => {
+        expect(isNextPurchaseFinal(world.user.id, world.course.id)).toBe(false);
+      });
+
+      it("tells a learner with an Issued Refund that buying again is a Final Purchase", () => {
+        refundFirstPurchase();
+
+        expect(isNextPurchaseFinal(world.user.id, world.course.id)).toBe(true);
+      });
+
+      it("keeps a Final Purchase to that learner and that course", () => {
+        refundFirstPurchase();
+        const other = addUser("Olive Other");
+        const { course: otherCourse } = addOtherCourse();
+
+        expect(isNextPurchaseFinal(other.id, world.course.id)).toBe(false);
+        expect(isNextPurchaseFinal(world.user.id, otherCourse.id)).toBe(false);
+      });
+
+      it("refuses a Refund Request on a Final Purchase, saying it can't be refunded", () => {
+        refundFirstPurchase();
+        buyCourse(world, daysAgo(0));
+
+        expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
+          eligible: false,
+          reason: "final_purchase",
+          message:
+            "You have already had a refund for this course, so this purchase is final and can't be refunded.",
+        });
+        expect(
+          raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+        ).toMatchObject({ raised: false, reason: "final_purchase" });
+        expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+        expect(listLearnerRefundRequests(world.user.id)).toHaveLength(1);
+      });
+
+      it("starts the learner from zero, enrolled and free to rate the course again", () => {
+        const quiz = addQuiz(world.lessonIds[0]);
+        const admin = addAdmin();
+        const refundRequest = approveOpenRequest(admin.id);
+        buildProgress(world.user.id, world.course.id, world.lessonIds, quiz);
+        markRefundIssued(refundRequest.id, admin.id);
+
+        buyCourse(world, daysAgo(0));
+
+        expect(
+          holdingsOf(world.user.id, world.course.id, world.lessonIds)
+        ).toEqual({ ...NOTHING, enrolled: true });
+        // Nothing of the old rating stands in the way of a new one.
+        rate(world.user.id, world.course.id, 2);
+        expect(ratingsOf(world.course.id)).toEqual([2]);
+      });
+
+      it("does not make a purchase Final when the earlier Refund Request was declined", () => {
+        const admin = addAdmin();
+        const refundRequest = raiseOpenRequest();
+        declineRefundRequest(refundRequest.id, admin.id);
+
+        expect(isNextPurchaseFinal(world.user.id, world.course.id)).toBe(false);
+        expect(
+          getRefundEligibility(world.user.id, world.course.id)
+        ).toMatchObject({ eligible: true });
+      });
+
+      it("does not make a purchase Final when the earlier Refund Request was withdrawn", () => {
+        const refundRequest = raiseOpenRequest();
+        withdrawRefundRequest(world.user.id, refundRequest.id);
+
+        expect(isNextPurchaseFinal(world.user.id, world.course.id)).toBe(false);
+        expect(
+          getRefundEligibility(world.user.id, world.course.id)
+        ).toMatchObject({ eligible: true });
+      });
+
+      it("does not make a purchase Final while the earlier Refund is only pending", () => {
+        approveOpenRequest(addAdmin().id);
+
+        expect(isNextPurchaseFinal(world.user.id, world.course.id)).toBe(false);
+      });
+
+      it("keeps every later purchase of the course Final too", () => {
+        refundFirstPurchase();
+        buyCourse(world, daysAgo(0));
+
+        expect(isNextPurchaseFinal(world.user.id, world.course.id)).toBe(true);
       });
     });
   });

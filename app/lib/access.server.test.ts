@@ -384,6 +384,76 @@ describe("getAccess", () => {
           canViewContent: false,
         });
       });
+
+      describe("and the learner buys the course again (a Final Purchase)", () => {
+        beforeEach(() => {
+          markRefundIssued(refundRequestId, adminId);
+        });
+
+        it("lets the learner view the course again, enrolled and not Locked", async () => {
+          buyCourse(world.user.id, world.course.id, {
+            createdAt: NOW.toISOString(),
+          });
+          signInAs(world.user.id);
+
+          const access = await getAccess(makeRequest(), world.course.id);
+
+          expect(access).toMatchObject({
+            enrolled: true,
+            locked: false,
+            canViewContent: true,
+          });
+        });
+
+        it("lets the learner add Progress in the course again", async () => {
+          buyCourse(world.user.id, world.course.id, {
+            createdAt: NOW.toISOString(),
+          });
+          signInAs(world.user.id);
+
+          const access = await requireContentAccess(
+            makeRequest(),
+            world.course.id
+          );
+
+          expect(access.canViewContent).toBe(true);
+        });
+
+        it("stays viewable when the learner asks for a Refund on it, because that is refused", async () => {
+          buyCourse(world.user.id, world.course.id, {
+            createdAt: NOW.toISOString(),
+          });
+          raiseRefundRequest(world.user.id, world.course.id, REASON, true);
+          signInAs(world.user.id);
+
+          const access = await getAccess(makeRequest(), world.course.id);
+
+          expect(access).toMatchObject({ locked: false, canViewContent: true });
+        });
+
+        it("checks the country of the Final Purchase, not the refunded one", async () => {
+          testDb
+            .update(schema.courses)
+            .set({ price: 7900, pppEnabled: true })
+            .run();
+          // The refunded purchase had no country; the Final Purchase was
+          // bought at a discount in India, and the learner is now in the US.
+          buyCourse(world.user.id, world.course.id, {
+            country: "IN",
+            createdAt: NOW.toISOString(),
+          });
+          signInAs(world.user.id);
+          mockSession.set("devCountry", "US");
+
+          const access = await getAccess(makeRequest(), world.course.id);
+
+          expect(access).toMatchObject({
+            enrolled: true,
+            pppBlocked: true,
+            canViewContent: false,
+          });
+        });
+      });
     });
   });
 

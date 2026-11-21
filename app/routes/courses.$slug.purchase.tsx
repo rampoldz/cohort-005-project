@@ -38,6 +38,7 @@ import { formatDuration, formatPrice } from "~/lib/utils";
 import { resolveCountry } from "~/lib/country.server";
 import { calculatePppPrice, getCountryTierInfo, COUNTRIES } from "~/lib/ppp";
 import { parseFormData, parseParams } from "~/lib/validation";
+import { isNextPurchaseFinal } from "~/lib/refund-requests.server";
 
 function getCourseBySlug(slug: string) {
   return db.select().from(courses).where(eq(courses.slug, slug)).get();
@@ -335,6 +336,9 @@ export async function loader({ params, request, url }: Route.LoaderArgs) {
     country,
     countryName,
     isEnrolled: enrolled,
+    // The learner has had an Issued Refund for this course, so buying it now
+    // is a Final Purchase. They are told before they pay.
+    isFinalPurchase: isNextPurchaseFinal(currentUserId, course.id),
   };
 }
 
@@ -391,6 +395,7 @@ export default function PurchaseConfirmation({
     tierInfo,
     countryName,
     isEnrolled,
+    isFinalPurchase,
   } = loaderData;
   const fetcher = useFetcher();
   const isSubmitting = fetcher.state !== "idle";
@@ -477,6 +482,22 @@ export default function PurchaseConfirmation({
               <div className="mb-4 rounded-lg bg-green-50 p-3 dark:bg-green-900/20">
                 <p className="text-sm text-green-800 dark:text-green-300">
                   PPP discount applied for {countryName} — {tierInfo.label}
+                </p>
+              </div>
+            )}
+
+            {isFinalPurchase && (
+              <div
+                role="note"
+                className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20"
+              >
+                <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                  This is a final purchase
+                </p>
+                <p className="mt-1 text-sm text-amber-900 dark:text-amber-200">
+                  You have already had a refund for this course, so this
+                  purchase can&apos;t be refunded. You will start the course
+                  from the beginning.
                 </p>
               </div>
             )}

@@ -36,6 +36,7 @@ const withdrawActionSchema = z.object({
 // reasons themselves, and their wording, belong to the Refund Request module.
 const REFUSAL_STATUS: Record<RefundRefusalReason, number> = {
   no_purchase: 403,
+  final_purchase: 403,
   request_undecided: 409,
   already_refunded: 409,
   team_seat_claimed: 403,

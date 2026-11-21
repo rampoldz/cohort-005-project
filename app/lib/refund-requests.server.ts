@@ -45,6 +45,7 @@ export type RefundRequest = typeof refunds.$inferSelect;
 /** Why a purchase can't be refunded. */
 export type RefundRefusalReason =
   | "no_purchase"
+  | "final_purchase"
   | "request_undecided"
   | "already_refunded"
   | "team_seat_claimed"
@@ -57,6 +58,8 @@ export type RefundRefusalReason =
 
 const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
   no_purchase: "You have not bought this course.",
+  final_purchase:
+    "You have already had a refund for this course, so this purchase is final and can't be refunded.",
   request_undecided:
     "You already have a refund request on this purchase that is open or approved.",
   already_refunded: "This purchase has already been refunded.",
@@ -188,6 +191,51 @@ function hasIssuedRefund(purchaseId: number) {
   return !!issued;
 }
 
+// Has the learner had an Issued Refund on any purchase of this course other
+// than `exceptPurchaseId`?
+function hasIssuedRefundForCourse(
+  userId: number,
+  courseId: number,
+  exceptPurchaseId: number | null
+) {
+  const issued = db
+    .select({ purchaseId: refunds.purchaseId })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .where(
+      and(
+        eq(purchases.userId, userId),
+        eq(purchases.courseId, courseId),
+        eq(refunds.status, RefundStatus.Approved),
+        isNotNull(refunds.issuedAt)
+      )
+    )
+    .all();
+
+  return issued.some((row) => row.purchaseId !== exceptPurchaseId);
+}
+
+/**
+ * Would a purchase of this course by this learner, made now, be a Final
+ * Purchase? It would once they have had an Issued Refund for the course: one
+ * Refund per learner per course, ever. Final is derived, never stored. The
+ * purchase page asks this so it can say so before they pay.
+ */
+export function isNextPurchaseFinal(userId: number, courseId: number): boolean {
+  return hasIssuedRefundForCourse(userId, courseId, null);
+}
+
+// A Final Purchase is one made after the learner's Issued Refund for the same
+// course. Only ever asked of the learner's latest purchase, so any other
+// purchase of the course is an earlier one.
+function isFinalPurchase(purchase: typeof purchases.$inferSelect) {
+  return hasIssuedRefundForCourse(
+    purchase.userId,
+    purchase.courseId,
+    purchase.id
+  );
+}
+
 // A seat that came out of a team licence, and has been claimed, belongs to
 // the team — the buyer cannot hand it back on their own.
 function hasClaimedTeamSeat(purchaseId: number) {
@@ -278,6 +326,10 @@ export function getRefundEligibility(
 
   if (!purchase) {
     return { eligible: false, ...refusal("no_purchase") };
+  }
+
+  if (isFinalPurchase(purchase)) {
+    return { eligible: false, ...refusal("final_purchase") };
   }
 
   if (hasUndecidedRefundRequest(purchase.id)) {
