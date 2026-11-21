@@ -43,7 +43,9 @@ export type RefundRefusalReason =
   | "window_closed"
   | "watched_too_much"
   | "completed_too_much"
-  | "warning_not_acknowledged";
+  | "warning_not_acknowledged"
+  | "request_not_found"
+  | "request_not_open";
 
 const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
   no_purchase: "You have not bought this course.",
@@ -57,6 +59,8 @@ const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
     "You have completed too much of this course to request a refund.",
   warning_not_acknowledged:
     "Confirm that you understand what requesting a refund does before sending it.",
+  request_not_found: "We couldn't find that refund request.",
+  request_not_open: "Only an open refund request can be withdrawn.",
 };
 
 export type RefundRefusal = {
@@ -513,3 +517,75 @@ export function listRefundRequests(): RefundRequestDetails[] {
 
   return withDetails(rows);
 }
+
+// ─── The learner's own Refund Requests ───
+
+export type WithdrawRefundRequestResult =
+  | { withdrawn: true; refundRequest: RefundRequest }
+  | ({ withdrawn: false } & RefundRefusal);
+
+/**
+ * Withdraws the learner's Open Refund Request, which unlocks the course at
+ * once with Progress as they left it. Only the learner who raised it can; to
+ * anyone else the request doesn't exist.
+ */
+export function withdrawRefundRequest(
+  userId: number,
+  refundRequestId: number
+): WithdrawRefundRequestResult {
+  const own = db
+    .select({ status: refunds.status })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .where(and(eq(refunds.id, refundRequestId), eq(purchases.userId, userId)))
+    .get();
+
+  if (!own) {
+    return { withdrawn: false, ...refusal("request_not_found") };
+  }
+
+  // No withdrawing once the team has decided, and nothing to withdraw twice.
+  if (own.status !== RefundStatus.Open) {
+    return { withdrawn: false, ...refusal("request_not_open") };
+  }
+
+  const refundRequest = db
+    .update(refunds)
+    .set({ status: RefundStatus.Withdrawn })
+    .where(eq(refunds.id, refundRequestId))
+    .returning()
+    .get();
+
+  return { withdrawn: true, refundRequest };
+}
+
+/**
+ * Every Refund Request the learner has raised, newest first, with what it was
+ * for and the state it is in. `refundIssued` tells a Pending Refund (approved,
+ * money not yet confirmed as sent) from an Issued Refund.
+ */
+export function listLearnerRefundRequests(userId: number) {
+  return db
+    .select({
+      id: refunds.id,
+      status: refunds.status,
+      refundIssued: sql<number>`${refunds.issuedAt} is not null`.mapWith(
+        Boolean
+      ),
+      reason: refunds.reason,
+      requestedAt: refunds.requestedAt,
+      amountPaid: purchases.amountPaid,
+      courseTitle: courses.title,
+      courseSlug: courses.slug,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(purchases.userId, userId))
+    .orderBy(desc(refunds.requestedAt), desc(refunds.id))
+    .all();
+}
+
+export type LearnerRefundRequest = ReturnType<
+  typeof listLearnerRefundRequests
+>[number];

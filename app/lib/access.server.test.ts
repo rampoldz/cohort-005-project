@@ -27,7 +27,9 @@ import { getAccess, requireContentAccess } from "./access.server";
 import {
   approveRefundRequest,
   declineRefundRequest,
+  getLockingRefundRequest,
   raiseRefundRequest,
+  withdrawRefundRequest,
 } from "./refund-requests.server";
 
 const NOW = new Date(2026, 5, 20, 12, 0, 0);
@@ -186,6 +188,40 @@ describe("getAccess", () => {
       const access = await getAccess(makeRequest(), world.course.id);
 
       expect(access).toMatchObject({ locked: false, canViewContent: true });
+    });
+
+    it("makes the course viewable again, still enrolled, once the learner withdraws", async () => {
+      const refundRequest = getLockingRefundRequest(
+        world.user.id,
+        world.course.id
+      )!;
+      withdrawRefundRequest(world.user.id, refundRequest.id);
+      signInAs(world.user.id);
+
+      const access = await getAccess(makeRequest(), world.course.id);
+
+      expect(access).toMatchObject({
+        enrolled: true,
+        locked: false,
+        canViewContent: true,
+      });
+      // Progress writes are accepted again.
+      await expect(
+        requireContentAccess(makeRequest(), world.course.id)
+      ).resolves.toMatchObject({ canViewContent: true });
+    });
+
+    it("stays Locked when someone else tries to withdraw the learner's Refund Request", async () => {
+      const refundRequest = getLockingRefundRequest(
+        world.user.id,
+        world.course.id
+      )!;
+      withdrawRefundRequest(world.instructor.id, refundRequest.id);
+      signInAs(world.user.id);
+
+      const access = await getAccess(makeRequest(), world.course.id);
+
+      expect(access).toMatchObject({ locked: true, canViewContent: false });
     });
 
     it("leaves the course's instructor unaffected", async () => {
