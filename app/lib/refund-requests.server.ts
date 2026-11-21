@@ -2,20 +2,25 @@ import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm"
 import { db } from "~/db";
 import {
   coupons,
+  courses,
   lessonProgress,
   lessons,
   modules,
   purchases,
   refunds,
+  users,
   videoWatchEvents,
   LessonProgressStatus,
   RefundStatus,
+  UserRole,
 } from "~/db/schema";
 
 // ─── Refund Requests ───
 // One place that holds every rule about a learner getting their money back:
-// whether a purchase can be refunded (and why not), and raising the Refund
-// Request. Routes and pages call this and hold no refund rules of their own.
+// whether a purchase can be refunded (and why not), raising the Refund
+// Request, the team approving or declining it, and whether that has the
+// course Locked. Routes and pages call this and hold no refund rules of their
+// own.
 // Vocabulary is in GLOSSARY.md; the decisions are in docs/adr/0001.
 //
 // Nothing here throws for a refused request — callers get the reason back and
@@ -43,7 +48,7 @@ export type RefundRefusalReason =
 const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
   no_purchase: "You have not bought this course.",
   request_undecided:
-    "You already have an open refund request on this purchase.",
+    "You already have a refund request on this purchase that is open or approved.",
   team_seat_claimed: "A claimed team seat cannot be refunded.",
   window_closed: `The ${REFUND_WINDOW_DAYS}-day window has closed.`,
   watched_too_much:
@@ -129,19 +134,28 @@ export function isCourseLocked(userId: number, courseId: number): boolean {
   return getLockingRefundRequest(userId, courseId) !== null;
 }
 
+// Only one Refund Request per purchase can be in play at once: an Open one,
+// or an approved one whose Refund hasn't been issued yet (a Pending Refund).
+// A Declined or Withdrawn request leaves the learner free to ask again.
 function hasUndecidedRefundRequest(purchaseId: number) {
-  const open = db
+  const undecided = db
     .select({ id: refunds.id })
     .from(refunds)
     .where(
       and(
         eq(refunds.purchaseId, purchaseId),
-        eq(refunds.status, RefundStatus.Open)
+        or(
+          eq(refunds.status, RefundStatus.Open),
+          and(
+            eq(refunds.status, RefundStatus.Approved),
+            isNull(refunds.issuedAt)
+          )
+        )
       )
     )
     .get();
 
-  return !!open;
+  return !!undecided;
 }
 
 // A seat that came out of a team licence, and has been claimed, belongs to
@@ -306,4 +320,196 @@ export function raiseRefundRequest(
     .get();
 
   return { raised: true, refundRequest, amount: eligibility.amount };
+}
+
+// ─── The team's decision ───
+// "The team" is admins. Instructors have no part in deciding Refunds.
+
+/** A Refund Request as the team sees it: who, which course, and how far in. */
+export type RefundRequestDetails = RefundRequest & {
+  learner: { id: number; name: string; email: string };
+  course: { id: number; title: string; slug: string };
+  /** What the learner paid — and so what the Refund is, if approved. */
+  amountPaid: number;
+  /** The admin who approved or declined it; null while undecided. */
+  resolvedBy: { id: number; name: string } | null;
+  lessonsCompleted: number;
+  lessonCount: number;
+  secondsWatched: number;
+};
+
+/** Why a Refund Request can't be approved or declined. */
+export type RefundDecisionRefusalReason =
+  | "not_admin"
+  | "request_not_found"
+  | "request_not_open";
+
+const DECISION_REFUSAL_MESSAGES: Record<RefundDecisionRefusalReason, string> = {
+  not_admin: "Only admins can decide refund requests.",
+  request_not_found: "That refund request does not exist.",
+  request_not_open: "Only an open refund request can be approved or declined.",
+};
+
+export type RefundDecisionResult =
+  | { decided: true; refundRequest: RefundRequestDetails }
+  | {
+      decided: false;
+      reason: RefundDecisionRefusalReason;
+      /** The reason in words the admin can be shown. */
+      message: string;
+    };
+
+function decisionRefusal(
+  reason: RefundDecisionRefusalReason
+): RefundDecisionResult {
+  return { decided: false, reason, message: DECISION_REFUSAL_MESSAGES[reason] };
+}
+
+/** May this user see and decide Refund Requests? Admins only. */
+export function canDecideRefundRequests(userId: number): boolean {
+  const user = db
+    .select({ role: users.role })
+    .from(users)
+    .where(eq(users.id, userId))
+    .get();
+
+  return user?.role === UserRole.Admin;
+}
+
+function withDetails(
+  rows: {
+    refundRequest: RefundRequest;
+    purchase: typeof purchases.$inferSelect;
+  }[]
+): RefundRequestDetails[] {
+  return rows.map(({ refundRequest, purchase }) => {
+    const learner = db
+      .select({ id: users.id, name: users.name, email: users.email })
+      .from(users)
+      .where(eq(users.id, purchase.userId))
+      .get()!;
+    const course = db
+      .select({ id: courses.id, title: courses.title, slug: courses.slug })
+      .from(courses)
+      .where(eq(courses.id, purchase.courseId))
+      .get()!;
+    const resolvedBy = refundRequest.resolvedByUserId
+      ? (db
+          .select({ id: users.id, name: users.name })
+          .from(users)
+          .where(eq(users.id, refundRequest.resolvedByUserId))
+          .get() ?? null)
+      : null;
+    const lessonIds = getCourseLessonIds(course.id);
+
+    return {
+      ...refundRequest,
+      learner,
+      course,
+      amountPaid: purchase.amountPaid,
+      resolvedBy,
+      lessonsCompleted: getCompletedLessonCount(learner.id, lessonIds),
+      lessonCount: lessonIds.length,
+      secondsWatched: getSecondsWatched(learner.id, lessonIds),
+    };
+  });
+}
+
+function getRefundRequestDetails(
+  refundRequestId: number
+): RefundRequestDetails | null {
+  const rows = db
+    .select({ refundRequest: refunds, purchase: purchases })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .where(eq(refunds.id, refundRequestId))
+    .all();
+
+  return withDetails(rows)[0] ?? null;
+}
+
+function decideRefundRequest(
+  refundRequestId: number,
+  adminUserId: number,
+  status: RefundStatus.Approved | RefundStatus.Declined
+): RefundDecisionResult {
+  if (!canDecideRefundRequests(adminUserId)) {
+    return decisionRefusal("not_admin");
+  }
+
+  const current = getRefundRequestDetails(refundRequestId);
+  if (!current) return decisionRefusal("request_not_found");
+
+  // The status is checked in the update itself, so two admins deciding at
+  // once can't both succeed.
+  const decided = db
+    .update(refunds)
+    .set({
+      status,
+      resolvedAt: new Date().toISOString(),
+      resolvedByUserId: adminUserId,
+      // A Refund is always the full amount paid; a declined request has none.
+      amountRefunded:
+        status === RefundStatus.Approved ? current.amountPaid : null,
+    })
+    .where(
+      and(eq(refunds.id, refundRequestId), eq(refunds.status, RefundStatus.Open))
+    )
+    .returning()
+    .get();
+
+  if (!decided) return decisionRefusal("request_not_open");
+
+  return {
+    decided: true,
+    refundRequest: getRefundRequestDetails(refundRequestId)!,
+  };
+}
+
+/**
+ * An admin turns an Open Refund Request down. It becomes a Declined Refund
+ * Request with no Refund: the course unlocks with Progress as it was, and the
+ * learner may raise a new one under the usual limits.
+ */
+export function declineRefundRequest(
+  refundRequestId: number,
+  adminUserId: number
+): RefundDecisionResult {
+  return decideRefundRequest(
+    refundRequestId,
+    adminUserId,
+    RefundStatus.Declined
+  );
+}
+
+/**
+ * An admin accepts an Open Refund Request. It becomes an Approved Refund
+ * Request with a Pending Refund for the full amount paid. Nothing else
+ * changes yet: the course stays Locked and Progress stays untouched until the
+ * Refund is issued.
+ */
+export function approveRefundRequest(
+  refundRequestId: number,
+  adminUserId: number
+): RefundDecisionResult {
+  return decideRefundRequest(
+    refundRequestId,
+    adminUserId,
+    RefundStatus.Approved
+  );
+}
+
+/**
+ * Every Refund Request, newest first, as the team sees them. Callers gate
+ * this with `canDecideRefundRequests`.
+ */
+export function listRefundRequests(): RefundRequestDetails[] {
+  const rows = db
+    .select({ refundRequest: refunds, purchase: purchases })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .orderBy(desc(refunds.requestedAt), desc(refunds.id))
+    .all();
+
+  return withDetails(rows);
 }

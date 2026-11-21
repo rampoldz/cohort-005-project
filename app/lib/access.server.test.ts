@@ -24,7 +24,11 @@ vi.mock("~/lib/session", () => ({
 }));
 
 import { getAccess, requireContentAccess } from "./access.server";
-import { raiseRefundRequest } from "./refund-requests.server";
+import {
+  approveRefundRequest,
+  declineRefundRequest,
+  raiseRefundRequest,
+} from "./refund-requests.server";
 
 const NOW = new Date(2026, 5, 20, 12, 0, 0);
 
@@ -194,6 +198,77 @@ describe("getAccess", () => {
         locked: false,
         canViewContent: true,
       });
+    });
+  });
+
+  describe("once an admin decides the learner's Refund Request", () => {
+    let adminId: number;
+    let refundRequestId: number;
+
+    beforeEach(() => {
+      adminId = testDb
+        .insert(schema.users)
+        .values({
+          name: "Admin",
+          email: "admin@example.com",
+          role: schema.UserRole.Admin,
+        })
+        .returning()
+        .get().id;
+      buyCourse(world.user.id, world.course.id);
+      const raised = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        true
+      );
+      if (!raised.raised) throw new Error("The Refund Request was refused");
+      refundRequestId = raised.refundRequest.id;
+    });
+
+    it("makes the course viewable again when it is declined", async () => {
+      declineRefundRequest(refundRequestId, adminId);
+      signInAs(world.user.id);
+
+      const access = await getAccess(makeRequest(), world.course.id);
+
+      expect(access).toMatchObject({
+        enrolled: true,
+        locked: false,
+        canViewContent: true,
+      });
+    });
+
+    it("lets the learner add Progress again when it is declined", async () => {
+      declineRefundRequest(refundRequestId, adminId);
+      signInAs(world.user.id);
+
+      const access = await requireContentAccess(makeRequest(), world.course.id);
+
+      expect(access.canViewContent).toBe(true);
+    });
+
+    it("keeps the course Locked and not viewable when it is approved", async () => {
+      approveRefundRequest(refundRequestId, adminId);
+      signInAs(world.user.id);
+
+      const access = await getAccess(makeRequest(), world.course.id);
+
+      // Still theirs until the Refund is issued.
+      expect(access).toMatchObject({
+        enrolled: true,
+        locked: true,
+        canViewContent: false,
+      });
+    });
+
+    it("keeps the course Locked when an instructor tries to decline it", async () => {
+      declineRefundRequest(refundRequestId, world.instructor.id);
+      signInAs(world.user.id);
+
+      const access = await getAccess(makeRequest(), world.course.id);
+
+      expect(access).toMatchObject({ locked: true, canViewContent: false });
     });
   });
 

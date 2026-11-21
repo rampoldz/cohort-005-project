@@ -12,6 +12,10 @@ vi.mock("~/db", () => ({
 }));
 
 import {
+  approveRefundRequest,
+  canDecideRefundRequests,
+  declineRefundRequest,
+  listRefundRequests,
   getLockingRefundRequest,
   getRefundEligibility,
   isCourseLocked,
@@ -315,6 +319,349 @@ describe("Refund Request module", () => {
     });
   });
 
+  describe("deciding a Refund Request", () => {
+    function addAdmin() {
+      return testDb
+        .insert(schema.users)
+        .values({
+          name: "Ada Admin",
+          email: "ada@example.com",
+          role: schema.UserRole.Admin,
+        })
+        .returning()
+        .get();
+    }
+
+    /** The learner buys the course and raises a Refund Request on it. */
+    function raiseOpenRequest() {
+      buyCourse(world);
+      const result = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        true
+      );
+      if (!result.raised) throw new Error("The Refund Request was refused");
+      return result.refundRequest;
+    }
+
+    describe("declining", () => {
+      it("makes it a Declined Refund Request, recording the admin and the moment", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+
+        const result = declineRefundRequest(request.id, admin.id);
+
+        expect(result).toMatchObject({
+          decided: true,
+          refundRequest: {
+            id: request.id,
+            status: schema.RefundStatus.Declined,
+            resolvedAt: NOW.toISOString(),
+            resolvedBy: { id: admin.id, name: "Ada Admin" },
+            amountRefunded: null,
+          },
+        });
+      });
+
+      it("unlocks the course", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+
+        declineRefundRequest(request.id, admin.id);
+
+        expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+      });
+
+      it("leaves the learner free to raise a new Refund Request", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+
+        declineRefundRequest(request.id, admin.id);
+
+        expect(
+          getRefundEligibility(world.user.id, world.course.id)
+        ).toMatchObject({ eligible: true, amount: 7900 });
+        expect(
+          raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+        ).toMatchObject({
+          raised: true,
+          refundRequest: { status: schema.RefundStatus.Open },
+        });
+      });
+
+      it("still holds a learner who asks again to the usual limits", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+        declineRefundRequest(request.id, admin.id);
+
+        // Back in the course, they finish half of it.
+        completeLessons(world, 5);
+
+        expect(
+          raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+        ).toMatchObject({ raised: false, reason: "completed_too_much" });
+      });
+
+      it("is refused to the course's instructor, and the request stays Open", () => {
+        const request = raiseOpenRequest();
+
+        const result = declineRefundRequest(request.id, world.instructor.id);
+
+        expect(result).toEqual({
+          decided: false,
+          reason: "not_admin",
+          message: "Only admins can decide refund requests.",
+        });
+        expect(
+          getLockingRefundRequest(world.user.id, world.course.id)
+        ).toMatchObject({ status: schema.RefundStatus.Open });
+      });
+
+      it("is refused to the learner who raised it", () => {
+        const request = raiseOpenRequest();
+
+        expect(declineRefundRequest(request.id, world.user.id)).toMatchObject({
+          decided: false,
+          reason: "not_admin",
+        });
+        expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+      });
+
+      it("is refused for a Refund Request that doesn't exist", () => {
+        const admin = addAdmin();
+
+        expect(declineRefundRequest(999, admin.id)).toEqual({
+          decided: false,
+          reason: "request_not_found",
+          message: "That refund request does not exist.",
+        });
+      });
+
+      it("is refused once the Refund Request has been declined", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+        declineRefundRequest(request.id, admin.id);
+
+        expect(declineRefundRequest(request.id, admin.id)).toEqual({
+          decided: false,
+          reason: "request_not_open",
+          message:
+            "Only an open refund request can be approved or declined.",
+        });
+      });
+    });
+
+    describe("approving", () => {
+      it("makes it an Approved Refund Request with a Refund of the full amount paid", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+
+        const result = approveRefundRequest(request.id, admin.id);
+
+        expect(result).toMatchObject({
+          decided: true,
+          refundRequest: {
+            id: request.id,
+            status: schema.RefundStatus.Approved,
+            amountPaid: 7900,
+            amountRefunded: 7900,
+            resolvedAt: NOW.toISOString(),
+            resolvedBy: { id: admin.id, name: "Ada Admin" },
+            // A Pending Refund: approved, the money not yet confirmed as sent.
+            issuedAt: null,
+          },
+        });
+      });
+
+      it("keeps the course Locked", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+
+        approveRefundRequest(request.id, admin.id);
+
+        expect(
+          getLockingRefundRequest(world.user.id, world.course.id)
+        ).toMatchObject({
+          id: request.id,
+          status: schema.RefundStatus.Approved,
+        });
+      });
+
+      it("leaves no room for another Refund Request on the purchase", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+
+        approveRefundRequest(request.id, admin.id);
+
+        expect(
+          raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+        ).toMatchObject({ raised: false, reason: "request_undecided" });
+      });
+
+      it("is refused to the course's instructor and to the learner", () => {
+        const request = raiseOpenRequest();
+
+        expect(
+          approveRefundRequest(request.id, world.instructor.id)
+        ).toMatchObject({ decided: false, reason: "not_admin" });
+        expect(approveRefundRequest(request.id, world.user.id)).toMatchObject({
+          decided: false,
+          reason: "not_admin",
+        });
+        expect(
+          getLockingRefundRequest(world.user.id, world.course.id)
+        ).toMatchObject({ status: schema.RefundStatus.Open });
+      });
+
+      it("is refused once the Refund Request has been declined", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+        declineRefundRequest(request.id, admin.id);
+
+        expect(approveRefundRequest(request.id, admin.id)).toMatchObject({
+          decided: false,
+          reason: "request_not_open",
+        });
+        expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+      });
+
+      it("can't be undone by declining afterwards", () => {
+        const admin = addAdmin();
+        const request = raiseOpenRequest();
+        approveRefundRequest(request.id, admin.id);
+
+        expect(declineRefundRequest(request.id, admin.id)).toMatchObject({
+          decided: false,
+          reason: "request_not_open",
+        });
+        expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+      });
+
+      it("is refused for a Refund Request the learner withdrew", () => {
+        const admin = addAdmin();
+        const purchase = buyCourse(world);
+        // Withdrawing isn't built yet, so the row is put there directly.
+        const withdrawn = testDb
+          .insert(schema.refunds)
+          .values({
+            purchaseId: purchase.id,
+            reason: REASON,
+            status: schema.RefundStatus.Withdrawn,
+          })
+          .returning()
+          .get();
+
+        expect(approveRefundRequest(withdrawn.id, admin.id)).toMatchObject({
+          decided: false,
+          reason: "request_not_open",
+        });
+      });
+    });
+
+    describe("what the team sees", () => {
+      it("lets only admins see and decide Refund Requests", () => {
+        const admin = addAdmin();
+
+        expect(canDecideRefundRequests(admin.id)).toBe(true);
+        expect(canDecideRefundRequests(world.instructor.id)).toBe(false);
+        expect(canDecideRefundRequests(world.user.id)).toBe(false);
+      });
+
+      it("lists an Open Refund Request with the learner, course, amount, reason, date and how far in they are", () => {
+        buyCourse(world);
+        completeLessons(world, 3);
+        watch(world, 0, 600);
+        watch(world, 1, 300);
+        raiseRefundRequest(world.user.id, world.course.id, REASON, true);
+
+        expect(listRefundRequests()).toMatchObject([
+          {
+            status: schema.RefundStatus.Open,
+            learner: { name: "Test User", email: "test@example.com" },
+            course: { title: "Test Course", slug: "test-course" },
+            amountPaid: 7900,
+            reason: REASON,
+            requestedAt: NOW.toISOString(),
+            lessonsCompleted: 3,
+            lessonCount: 10,
+            secondsWatched: 900,
+            resolvedBy: null,
+          },
+        ]);
+      });
+
+      it("lists past Refund Requests with their outcomes, newest first", () => {
+        const admin = addAdmin();
+        const first = raiseOpenRequest();
+        declineRefundRequest(first.id, admin.id);
+        const second = raiseRefundRequest(
+          world.user.id,
+          world.course.id,
+          REASON,
+          true
+        );
+        if (!second.raised) throw new Error("The Refund Request was refused");
+        approveRefundRequest(second.refundRequest.id, admin.id);
+
+        expect(listRefundRequests()).toMatchObject([
+          {
+            id: second.refundRequest.id,
+            status: schema.RefundStatus.Approved,
+            amountRefunded: 7900,
+            resolvedBy: { name: "Ada Admin" },
+          },
+          {
+            id: first.id,
+            status: schema.RefundStatus.Declined,
+            amountRefunded: null,
+            resolvedBy: { name: "Ada Admin" },
+          },
+        ]);
+      });
+
+      it("shows the learner's Progress untouched by a decline", () => {
+        const admin = addAdmin();
+        buyCourse(world);
+        completeLessons(world, 3);
+        watch(world, 0, 600);
+        const raised = raiseRefundRequest(
+          world.user.id,
+          world.course.id,
+          REASON,
+          true
+        );
+        if (!raised.raised) throw new Error("The Refund Request was refused");
+
+        declineRefundRequest(raised.refundRequest.id, admin.id);
+
+        expect(listRefundRequests()).toMatchObject([
+          { lessonsCompleted: 3, secondsWatched: 600 },
+        ]);
+      });
+
+      it("shows the learner's Progress untouched by an approval", () => {
+        const admin = addAdmin();
+        buyCourse(world);
+        completeLessons(world, 3);
+        watch(world, 0, 600);
+        const raised = raiseRefundRequest(
+          world.user.id,
+          world.course.id,
+          REASON,
+          true
+        );
+        if (!raised.raised) throw new Error("The Refund Request was refused");
+
+        approveRefundRequest(raised.refundRequest.id, admin.id);
+
+        expect(listRefundRequests()).toMatchObject([
+          { lessonsCompleted: 3, secondsWatched: 600 },
+        ]);
+      });
+    });
+  });
+
   describe("why a purchase can't be refunded", () => {
     it("refuses a learner who has not bought the course", () => {
       expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
@@ -331,7 +678,31 @@ describe("Refund Request module", () => {
       expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
         eligible: false,
         reason: "request_undecided",
-        message: "You already have an open refund request on this purchase.",
+        message:
+          "You already have a refund request on this purchase that is open or approved.",
+      });
+    });
+
+    it("refuses while an approved Refund on the purchase has not been issued", () => {
+      const purchase = buyCourse(world);
+      testDb
+        .insert(schema.refunds)
+        .values({
+          purchaseId: purchase.id,
+          reason: REASON,
+          status: schema.RefundStatus.Approved,
+          amountRefunded: 7900,
+          resolvedAt: daysAgo(1),
+        })
+        .run();
+
+      expect(
+        raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+      ).toEqual({
+        raised: false,
+        reason: "request_undecided",
+        message:
+          "You already have a refund request on this purchase that is open or approved.",
       });
     });
 
