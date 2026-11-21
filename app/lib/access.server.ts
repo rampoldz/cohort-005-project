@@ -1,16 +1,14 @@
 import { data } from "react-router";
 import { eq, and } from "drizzle-orm";
 import { db } from "~/db";
-import {
-  UserRole,
-  users,
-  courses,
-  enrollments,
-  purchases,
-} from "~/db/schema";
+import { UserRole, users, courses, enrollments } from "~/db/schema";
 import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
 import { checkPppAccess } from "~/lib/ppp";
+import {
+  getLatestPurchase,
+  isCourseLocked,
+} from "~/lib/refund-requests.server";
 
 function getUserById(id: number) {
   return db.select().from(users).where(eq(users.id, id)).get();
@@ -32,14 +30,6 @@ function findEnrollment(userId: number, courseId: number) {
 
 function isUserEnrolled(userId: number, courseId: number) {
   return !!findEnrollment(userId, courseId);
-}
-
-function findPurchase(userId: number, courseId: number) {
-  return db
-    .select()
-    .from(purchases)
-    .where(and(eq(purchases.userId, userId), eq(purchases.courseId, courseId)))
-    .get();
 }
 
 // ─── Access Resolution ───
@@ -64,8 +54,15 @@ export type Access = {
   pppBlockedCountry: string | null;
   pppPurchaseCountry: string | null;
   /**
-   * May they read the course's content (lesson bodies, comments)?
-   * Staff always can. Students need an enrollment that isn't PPP-blocked.
+   * The course is Locked for this learner: they paid for it but can't open it
+   * while their Refund Request is Open, or approved with the Refund not yet
+   * issued. Never true for staff.
+   */
+  locked: boolean;
+  /**
+   * May they read the course's content (lesson bodies, comments) and add
+   * Progress in it? Staff always can. Students need an enrollment that isn't
+   * PPP-blocked and a course that isn't Locked.
    */
   canViewContent: boolean;
 };
@@ -80,8 +77,13 @@ const SIGNED_OUT: Access = {
   pppBlocked: false,
   pppBlockedCountry: null,
   pppPurchaseCountry: null,
+  locked: false,
   canViewContent: false,
 };
+
+/** What a learner is told when they try to use a Locked course. */
+export const LOCKED_MESSAGE =
+  "This course is locked because you have asked for a refund on it.";
 
 export async function getAccess(
   request: Request,
@@ -107,7 +109,7 @@ export async function getAccess(
   };
 
   if (enrolled && !isStaff && course) {
-    const purchase = findPurchase(userId, courseId);
+    const purchase = getLatestPurchase(userId, courseId);
     const currentCountry = await resolveCountry(request);
     ppp = checkPppAccess(
       course.price,
@@ -116,6 +118,9 @@ export async function getAccess(
       currentCountry
     );
   }
+
+  // The lock belongs to the Refund Request module; staff are never locked out.
+  const locked = !isStaff && isCourseLocked(userId, courseId);
 
   return {
     userId,
@@ -127,7 +132,8 @@ export async function getAccess(
     pppBlocked: ppp.blocked,
     pppBlockedCountry: ppp.blockedCountry,
     pppPurchaseCountry: ppp.purchaseCountry,
-    canViewContent: isStaff || (enrolled && !ppp.blocked),
+    locked,
+    canViewContent: isStaff || (enrolled && !ppp.blocked && !locked),
   };
 }
 
@@ -154,6 +160,10 @@ export async function requireContentAccess(
 
   if (!access.userId) {
     throw data("Select a user from the DevUI panel.", { status: 401 });
+  }
+
+  if (access.locked) {
+    throw data(LOCKED_MESSAGE, { status: 403 });
   }
 
   if (!access.canViewContent) {

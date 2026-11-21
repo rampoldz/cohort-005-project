@@ -15,6 +15,7 @@ import {
   lessonProgress,
   courseRatings,
   LessonProgressStatus,
+  RefundStatus,
 } from "~/db/schema";
 import { eq, and, or, sql } from "drizzle-orm";
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
@@ -33,6 +34,7 @@ import {
   CheckCircle2,
   Circle,
   Clock,
+  Lock,
   Pencil,
   PlayCircle,
   Users,
@@ -49,7 +51,11 @@ import {
   getCountryTierInfo,
 } from "~/lib/ppp";
 import { parseFormData } from "~/lib/validation";
-import { getRefundEligibility } from "~/lib/refund-requests.server";
+import {
+  getLockingRefundRequest,
+  getRefundEligibility,
+} from "~/lib/refund-requests.server";
+import { getAccess, LOCKED_MESSAGE } from "~/lib/access.server";
 import { MAX_RATING, MIN_RATING } from "~/lib/ratings";
 import { StarRating, StarRatingInput } from "~/components/star-rating";
 
@@ -395,15 +401,30 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
   let refundOffer: { amount: number } | null = null;
+  // Set while the course is Locked for this learner: which stage their Refund
+  // Request is at, so the page can say why.
+  let lock: { refundApproved: boolean } | null = null;
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
 
     if (enrolled) {
+      const access = await getAccess(request, course.id);
+      if (access.locked) {
+        const lockingRequest = getLockingRefundRequest(
+          currentUserId,
+          course.id
+        );
+        lock = {
+          refundApproved: lockingRequest?.status === RefundStatus.Approved,
+        };
+      }
+
       const refundEligibility = getRefundEligibility(currentUserId, course.id);
-      refundOffer = refundEligibility.eligible
-        ? { amount: refundEligibility.amount }
-        : null;
+      refundOffer =
+        refundEligibility.eligible && !lock
+          ? { amount: refundEligibility.amount }
+          : null;
 
       progress = calculateProgress(currentUserId, course.id, false);
 
@@ -448,6 +469,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ratingSummary,
     userRating,
     refundOffer,
+    lock,
   };
 }
 
@@ -469,6 +491,11 @@ export async function action({ params, request }: Route.ActionArgs) {
     throw data("You must be enrolled in this course to rate it.", {
       status: 403,
     });
+  }
+
+  // A rating is part of the learner's Progress, so a Locked course takes none.
+  if ((await getAccess(request, course.id)).locked) {
+    throw data(LOCKED_MESSAGE, { status: 403 });
   }
 
   const formData = await request.formData();
@@ -549,6 +576,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     ratingSummary,
     userRating,
     refundOffer,
+    lock,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -736,9 +764,11 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               <h2 className="text-lg font-semibold">
                 {isInstructor
                   ? "Your Course"
-                  : enrolled
-                    ? "Your Progress"
-                    : "Get Started"}
+                  : lock
+                    ? "Course Locked"
+                    : enrolled
+                      ? "Your Progress"
+                      : "Get Started"}
               </h2>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -749,6 +779,11 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                     Manage Course
                   </Button>
                 </Link>
+              ) : lock ? (
+                <CourseLocked
+                  refundApproved={lock.refundApproved}
+                  progress={progress}
+                />
               ) : enrolled ? (
                 <>
                   <div className="mb-2 flex items-center justify-between text-sm">
@@ -861,9 +896,44 @@ function RateCourse({ userRating }: { userRating: number | null }) {
   );
 }
 
+/**
+ * What a learner sees in place of their progress card while the course is
+ * Locked: why, and what happens next.
+ */
+function CourseLocked({
+  refundApproved,
+  progress,
+}: {
+  refundApproved: boolean;
+  progress: number;
+}) {
+  return (
+    <div className="space-y-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+      <div className="flex items-center gap-2 font-medium">
+        <Lock className="size-4 text-amber-600" />
+        <span>This course is locked for you</span>
+      </div>
+      <p className="text-muted-foreground">
+        {refundApproved
+          ? "Your refund request was approved and your refund is on its way. The course stays locked until the refund is issued."
+          : "You asked for a refund on this course, so you can't open its lessons while our team reviews your refund request."}
+      </p>
+      <p className="text-muted-foreground">
+        {refundApproved
+          ? `Your progress (${progress}% complete) is kept until the refund is issued, and erased for good when it is.`
+          : `Your progress (${progress}% complete) is kept as you left it. If your refund request is declined, the course unlocks again.`}
+      </p>
+      <Link to="/settings" className="inline-block underline">
+        See your refund request
+      </Link>
+    </div>
+  );
+}
+
 function RequestRefund({ slug, amount }: { slug: string; amount: number }) {
   const fetcher = useFetcher<{ errors?: Record<string, string> }>();
   const [isFormOpen, setIsFormOpen] = useState(false);
+  const [warningAcknowledged, setWarningAcknowledged] = useState(false);
   const isSubmitting = fetcher.state !== "idle";
 
   useEffect(() => {
@@ -906,8 +976,42 @@ function RequestRefund({ slug, amount }: { slug: string; amount: number }) {
           required
           placeholder="What went wrong?"
         />
+        <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+          <div className="flex items-center gap-1.5 font-medium">
+            <AlertTriangle className="size-3.5 text-amber-600" />
+            <span>Before you send this</span>
+          </div>
+          <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
+            <li>
+              You lose access to this course while your refund request is
+              reviewed.
+            </li>
+            <li>
+              If the refund is paid, your progress in this course is erased for
+              good.
+            </li>
+            <li>
+              If you buy this course again, that purchase can't be refunded.
+            </li>
+          </ul>
+          <label className="flex items-start gap-2 pt-1 font-medium">
+            <input
+              type="checkbox"
+              name="acknowledgeWarning"
+              required
+              className="mt-0.5"
+              checked={warningAcknowledged}
+              onChange={(event) => setWarningAcknowledged(event.target.checked)}
+            />
+            <span>I understand and want to request a refund.</span>
+          </label>
+        </div>
         <div className="flex gap-2">
-          <Button type="submit" size="sm" disabled={isSubmitting}>
+          <Button
+            type="submit"
+            size="sm"
+            disabled={isSubmitting || !warningAcknowledged}
+          >
             {isSubmitting ? "Sending..." : "Request a refund"}
           </Button>
           <Button

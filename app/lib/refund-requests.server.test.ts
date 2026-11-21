@@ -12,7 +12,9 @@ vi.mock("~/db", () => ({
 }));
 
 import {
+  getLockingRefundRequest,
   getRefundEligibility,
+  isCourseLocked,
   raiseRefundRequest,
 } from "./refund-requests.server";
 
@@ -144,7 +146,7 @@ describe("Refund Request module", () => {
     it("raises an Open Refund Request with the learner's reason", () => {
       const purchase = buyCourse(world);
 
-      const result = raiseRefundRequest(world.user.id, world.course.id, REASON);
+      const result = raiseRefundRequest(world.user.id, world.course.id, REASON, true);
 
       expect(result).toMatchObject({
         raised: true,
@@ -155,6 +157,161 @@ describe("Refund Request module", () => {
           reason: REASON,
         },
       });
+    });
+  });
+
+  describe("a Locked course", () => {
+    /** Puts a Refund Request on the purchase in a state nothing can reach yet. */
+    function addRefundRequest(
+      purchaseId: number,
+      values: Partial<typeof schema.refunds.$inferInsert>
+    ) {
+      return testDb
+        .insert(schema.refunds)
+        .values({ purchaseId, reason: REASON, ...values })
+        .returning()
+        .get();
+    }
+
+    it("is not Locked for a learner who has only bought the course", () => {
+      buyCourse(world);
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+      expect(getLockingRefundRequest(world.user.id, world.course.id)).toBeNull();
+    });
+
+    it("is not Locked for someone who has not bought the course", () => {
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+    });
+
+    it("is Locked from the moment a Refund Request is raised", () => {
+      buyCourse(world);
+
+      const result = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        true
+      );
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+      expect(
+        getLockingRefundRequest(world.user.id, world.course.id)
+      ).toMatchObject({
+        id: result.raised ? result.refundRequest.id : undefined,
+        status: schema.RefundStatus.Open,
+      });
+    });
+
+    it("leaves the learner's Progress untouched when a Refund Request is raised", () => {
+      buyCourse(world);
+      completeLessons(world, 3);
+      watch(world, 0, 600);
+      // No interface reports Progress yet, so this one reads the tables.
+      const progressBefore = testDb.select().from(schema.lessonProgress).all();
+      const watchedBefore = testDb.select().from(schema.videoWatchEvents).all();
+
+      raiseRefundRequest(world.user.id, world.course.id, REASON, true);
+
+      expect(testDb.select().from(schema.lessonProgress).all()).toEqual(
+        progressBefore
+      );
+      expect(testDb.select().from(schema.videoWatchEvents).all()).toEqual(
+        watchedBefore
+      );
+      expect(progressBefore).toHaveLength(3);
+    });
+
+    it("stays unlocked when the Refund Request is refused", () => {
+      buyCourse(world);
+
+      raiseRefundRequest(world.user.id, world.course.id, REASON, false);
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+    });
+
+    it("is Locked while the Refund Request is approved and the Refund not yet issued", () => {
+      const purchase = buyCourse(world);
+      addRefundRequest(purchase.id, {
+        status: schema.RefundStatus.Approved,
+        amountRefunded: 7900,
+        resolvedAt: daysAgo(1),
+      });
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+      expect(
+        getLockingRefundRequest(world.user.id, world.course.id)
+      ).toMatchObject({ status: schema.RefundStatus.Approved });
+    });
+
+    it("is not Locked by a declined or withdrawn Refund Request", () => {
+      const purchase = buyCourse(world);
+      addRefundRequest(purchase.id, {
+        status: schema.RefundStatus.Declined,
+        resolvedAt: daysAgo(2),
+      });
+      addRefundRequest(purchase.id, { status: schema.RefundStatus.Withdrawn });
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+    });
+
+    it("is not Locked once the Refund is issued", () => {
+      const purchase = buyCourse(world);
+      addRefundRequest(purchase.id, {
+        status: schema.RefundStatus.Approved,
+        amountRefunded: 7900,
+        resolvedAt: daysAgo(2),
+        issuedAt: daysAgo(1),
+      });
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+    });
+
+    it("is decided by the learner's latest purchase of the course", () => {
+      const earlier = buyCourse(world, daysAgo(40));
+      addRefundRequest(earlier.id, { status: schema.RefundStatus.Open });
+      testDb
+        .insert(schema.purchases)
+        .values({
+          userId: world.user.id,
+          courseId: world.course.id,
+          amountPaid: 7900,
+          createdAt: daysAgo(2),
+        })
+        .run();
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+    });
+
+    it("locks only the course the Refund Request is for, and only for that learner", () => {
+      buyCourse(world);
+      const otherCourse = testDb
+        .insert(schema.courses)
+        .values({
+          title: "Other Course",
+          slug: "other-course",
+          description: "Another course",
+          salesCopy: "Sales copy",
+          instructorId: world.instructor.id,
+          categoryId: world.category.id,
+          status: schema.CourseStatus.Published,
+        })
+        .returning()
+        .get();
+      testDb
+        .insert(schema.purchases)
+        .values({
+          userId: world.user.id,
+          courseId: otherCourse.id,
+          amountPaid: 4900,
+          createdAt: daysAgo(3),
+        })
+        .run();
+
+      raiseRefundRequest(world.user.id, world.course.id, REASON, true);
+
+      expect(isCourseLocked(world.user.id, otherCourse.id)).toBe(false);
+      expect(isCourseLocked(world.instructor.id, world.course.id)).toBe(false);
     });
   });
 
@@ -169,7 +326,7 @@ describe("Refund Request module", () => {
 
     it("refuses while a Refund Request on the purchase is undecided", () => {
       buyCourse(world);
-      raiseRefundRequest(world.user.id, world.course.id, REASON);
+      raiseRefundRequest(world.user.id, world.course.id, REASON, true);
 
       expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
         eligible: false,
@@ -269,7 +426,7 @@ describe("Refund Request module", () => {
       buyCourse(world);
       completeLessons(world, 5);
 
-      const result = raiseRefundRequest(world.user.id, world.course.id, REASON);
+      const result = raiseRefundRequest(world.user.id, world.course.id, REASON, true);
 
       expect(result).toEqual({
         raised: false,
@@ -283,11 +440,33 @@ describe("Refund Request module", () => {
       );
     });
 
+    it("refuses a learner who has not confirmed the warning and raises nothing", () => {
+      buyCourse(world);
+
+      const result = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        false
+      );
+
+      expect(result).toEqual({
+        raised: false,
+        reason: "warning_not_acknowledged",
+        message:
+          "Confirm that you understand what requesting a refund does before sending it.",
+      });
+      // Nothing was raised: the purchase can still be refunded.
+      expect(getRefundEligibility(world.user.id, world.course.id)).toMatchObject(
+        { eligible: true }
+      );
+    });
+
     it("refuses a second Refund Request while the first is undecided", () => {
       buyCourse(world);
-      raiseRefundRequest(world.user.id, world.course.id, REASON);
+      raiseRefundRequest(world.user.id, world.course.id, REASON, true);
 
-      const second = raiseRefundRequest(world.user.id, world.course.id, REASON);
+      const second = raiseRefundRequest(world.user.id, world.course.id, REASON, true);
 
       expect(second).toMatchObject({
         raised: false,

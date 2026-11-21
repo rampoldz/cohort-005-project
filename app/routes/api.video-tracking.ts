@@ -3,8 +3,10 @@ import { z } from "zod";
 import type { Route } from "./+types/api.video-tracking";
 import { getCurrentUserId } from "~/lib/session";
 import { parseJsonBody } from "~/lib/validation";
+import { eq } from "drizzle-orm";
 import { db } from "~/db";
-import { videoWatchEvents } from "~/db/schema";
+import { lessons, modules, videoWatchEvents } from "~/db/schema";
+import { requireContentAccess } from "~/lib/access.server";
 
 const videoTrackingSchema = z.object({
   lessonId: z.number(),
@@ -25,6 +27,21 @@ export async function action({ request }: Route.ActionArgs) {
   }
 
   const { lessonId, eventType, positionSeconds } = parsed.data;
+
+  // A watch event is Progress, so the lesson's course must be viewable — a
+  // Locked learner can't add to it.
+  const lessonCourse = db
+    .select({ courseId: modules.courseId })
+    .from(lessons)
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .where(eq(lessons.id, lessonId))
+    .get();
+
+  if (!lessonCourse) {
+    throw data("Lesson not found", { status: 404 });
+  }
+
+  await requireContentAccess(request, lessonCourse.courseId);
 
   db
     .insert(videoWatchEvents)

@@ -41,6 +41,7 @@ import {
   Clock,
   Github,
   HelpCircle,
+  Lock,
   MapPin,
   PlayCircle,
   ShieldAlert,
@@ -731,8 +732,11 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   if (currentUserId) {
     if (enrolled) {
-      // Mark lesson as in-progress when viewed
-      markLessonInProgress(currentUserId, lessonId);
+      // Mark lesson as in-progress when viewed. That is Progress, so it needs
+      // a viewable course — a Locked learner's Progress stays as they left it.
+      if (access.canViewContent) {
+        markLessonInProgress(currentUserId, lessonId);
+      }
       const progress = getLessonProgress(currentUserId, lessonId);
       lessonStatus = progress?.status ?? null;
 
@@ -762,8 +766,13 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   // PPP Access Guard — resolved by getAccess, which treats a blocked user as
   // having no access to the course's content at all.
-  const { pppBlocked, pppBlockedCountry, pppPurchaseCountry, canViewContent } =
-    access;
+  const {
+    pppBlocked,
+    pppBlockedCountry,
+    pppPurchaseCountry,
+    canViewContent,
+    locked,
+  } = access;
 
   // Comments are confidential to the course: only people who can read the
   // lesson can read the discussion on it.
@@ -773,9 +782,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     : [];
 
   // Render lesson content from Markdown to HTML server-side
-  const contentHtml = lesson.content
-    ? await renderMarkdown(lesson.content)
-    : null;
+  // A Locked learner gets the locked notice instead of the lesson, so the
+  // lesson itself is not sent to them.
+  const contentHtml =
+    lesson.content && !locked ? await renderMarkdown(lesson.content) : null;
 
   // Build prev/next navigation
   const allLessons = flattenCourseLessons(courseWithDetails);
@@ -800,7 +810,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   } | null = null;
   let bestAttempt: { score: number; passed: boolean } | null = null;
 
-  if (quizRecord) {
+  if (quizRecord && !locked) {
     const quizData = getQuizWithQuestions(quizRecord.id);
     if (quizData) {
       // Strip isCorrect from options so answers aren't leaked to the client
@@ -847,10 +857,13 @@ export async function loader({ params, request }: Route.LoaderArgs) {
       id: mod.id,
       title: mod.title,
     },
-    lesson,
+    lesson: locked
+      ? { ...lesson, content: null, videoUrl: null, githubRepoUrl: null }
+      : lesson,
     contentHtml,
     lessonStatus,
     enrolled,
+    locked,
     currentUserId,
     prevLesson,
     nextLesson,
@@ -880,6 +893,13 @@ export async function action({ params, request }: Route.ActionArgs) {
   const currentUserId = await getCurrentUserId(request);
   if (!currentUserId) {
     throw data("You must be logged in", { status: 401 });
+  }
+
+  // Access is checked against the course in the URL, so the lesson has to be
+  // one of that course's — otherwise a Locked course's lesson could be
+  // reached through another course's address.
+  if (getCourseForLesson(lessonId)?.courseId !== course.id) {
+    throw data("Lesson not found in this course", { status: 404 });
   }
 
   const formData = await request.formData();
@@ -944,7 +964,10 @@ export async function action({ params, request }: Route.ActionArgs) {
     }
   }
 
+  // Completing a lesson and submitting a quiz add Progress, which needs a
+  // viewable course — a Locked learner is refused here.
   if (intent === "mark-complete") {
+    await requireContentAccess(request, course.id);
     markLessonComplete(currentUserId, lessonId);
     return { success: true };
   }
@@ -953,6 +976,17 @@ export async function action({ params, request }: Route.ActionArgs) {
     const quizId = Number(formData.get("quizId"));
     if (isNaN(quizId)) {
       throw data("Invalid quiz ID", { status: 400 });
+    }
+
+    await requireContentAccess(request, course.id);
+
+    const quizOnThisLesson = db
+      .select({ id: quizzes.id })
+      .from(quizzes)
+      .where(and(eq(quizzes.id, quizId), eq(quizzes.lessonId, lessonId)))
+      .get();
+    if (!quizOnThisLesson) {
+      throw data("Quiz not found on this lesson", { status: 404 });
     }
 
     // Collect answers: form fields named "question-{questionId}" with value = optionId
@@ -1015,6 +1049,7 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     contentHtml,
     lessonStatus,
     enrolled,
+    locked,
     currentUserId,
     prevLesson,
     nextLesson,
@@ -1086,6 +1121,34 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
                 <MapPin className="mr-2 size-4" />
                 Back to Course
               </Button>
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (locked) {
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center p-6">
+        <div className="max-w-md text-center">
+          <Lock className="mx-auto mb-4 size-16 text-amber-500" />
+          <h1 className="mb-3 text-2xl font-bold">This course is locked</h1>
+          <p className="mb-4 text-muted-foreground">
+            You asked for a refund on <strong>{course.title}</strong>, so you
+            can't open <strong>{lesson.title}</strong> or any of its other
+            lessons while your refund request is being handled.
+          </p>
+          <p className="mb-6 text-sm text-muted-foreground">
+            Your progress is kept as you left it. You can follow your refund
+            request in your settings.
+          </p>
+          <div className="flex items-center justify-center gap-3">
+            <Link to={`/courses/${course.slug}`}>
+              <Button variant="outline">Back to Course</Button>
+            </Link>
+            <Link to="/settings">
+              <Button variant="outline">Go to Settings</Button>
             </Link>
           </div>
         </div>

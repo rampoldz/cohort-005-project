@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
   coupons,
@@ -37,7 +37,8 @@ export type RefundRefusalReason =
   | "team_seat_claimed"
   | "window_closed"
   | "watched_too_much"
-  | "completed_too_much";
+  | "completed_too_much"
+  | "warning_not_acknowledged";
 
 const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
   no_purchase: "You have not bought this course.",
@@ -49,6 +50,8 @@ const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
     "You have watched too much of this course to request a refund.",
   completed_too_much:
     "You have completed too much of this course to request a refund.",
+  warning_not_acknowledged:
+    "Confirm that you understand what requesting a refund does before sending it.",
 };
 
 export type RefundRefusal = {
@@ -74,13 +77,56 @@ function refusal(reason: RefundRefusalReason): RefundRefusal {
   return { reason, message: REFUSAL_MESSAGES[reason] };
 }
 
-function getLatestPurchase(userId: number, courseId: number) {
+/**
+ * The learner's latest purchase of this course. A learner can have more than
+ * one, and every refund rule — and the access resolver — reads the latest.
+ */
+export function getLatestPurchase(userId: number, courseId: number) {
   return db
     .select()
     .from(purchases)
     .where(and(eq(purchases.userId, userId), eq(purchases.courseId, courseId)))
-    .orderBy(sql`${purchases.createdAt} desc`)
+    .orderBy(desc(purchases.createdAt), desc(purchases.id))
     .get();
+}
+
+/**
+ * The Refund Request that has this course Locked for the learner, or null
+ * when it isn't Locked. Locked is derived, never stored: the learner's latest
+ * purchase has a Refund Request that is Open, or approved with the Refund not
+ * yet issued (a Pending Refund).
+ */
+export function getLockingRefundRequest(
+  userId: number,
+  courseId: number
+): RefundRequest | null {
+  const purchase = getLatestPurchase(userId, courseId);
+  if (!purchase) return null;
+
+  const locking = db
+    .select()
+    .from(refunds)
+    .where(
+      and(
+        eq(refunds.purchaseId, purchase.id),
+        or(
+          eq(refunds.status, RefundStatus.Open),
+          and(
+            eq(refunds.status, RefundStatus.Approved),
+            isNull(refunds.issuedAt)
+          )
+        )
+      )
+    )
+    .orderBy(desc(refunds.id))
+    .get();
+
+  return locking ?? null;
+}
+
+/** Is this course Locked for the learner? */
+export function isCourseLocked(userId: number, courseId: number): boolean {
+  return getLockingRefundRequest(userId, courseId) !== null;
 }
 
 function hasUndecidedRefundRequest(purchaseId: number) {
@@ -225,12 +271,15 @@ export function getRefundEligibility(
 
 /**
  * Raises an Open Refund Request on the learner's latest purchase of this
- * course, or refuses with the reason the purchase can't be refunded.
+ * course, or refuses with the reason the purchase can't be refunded. Raising
+ * it locks the course, so the learner must have confirmed the warning that
+ * says so (`warningAcknowledged`).
  */
 export function raiseRefundRequest(
   userId: number,
   courseId: number,
-  reason: string
+  reason: string,
+  warningAcknowledged: boolean
 ): RaiseRefundRequestResult {
   const eligibility = getRefundEligibility(userId, courseId);
 
@@ -240,6 +289,10 @@ export function raiseRefundRequest(
       reason: eligibility.reason,
       message: eligibility.message,
     };
+  }
+
+  if (!warningAcknowledged) {
+    return { raised: false, ...refusal("warning_not_acknowledged") };
   }
 
   const refundRequest = db

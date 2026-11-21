@@ -22,6 +22,9 @@ const refundActionSchema = z.object({
     .trim()
     .min(10, "Tell us a little more about why you want a refund.")
     .max(1000, "Please keep your reason under 1000 characters."),
+  // The checkbox under the warning. Absent when unticked; the Refund Request
+  // module is what refuses a request without it.
+  acknowledgeWarning: z.string().optional(),
 });
 
 // How each reason a purchase can't be refunded is reported over HTTP. The
@@ -33,6 +36,7 @@ const REFUSAL_STATUS: Record<RefundRefusalReason, number> = {
   window_closed: 403,
   watched_too_much: 403,
   completed_too_much: 403,
+  warning_not_acknowledged: 400,
 };
 
 function getCourseBySlug(slug: string) {
@@ -58,7 +62,7 @@ function buildRefundRequestEmail(input: {
       `We have your refund request for "${input.courseTitle}".`,
       `The refund is for ${formatPrice(input.amount)}, the amount you paid.`,
       "",
-      "Our team reviews every refund request by hand. You do not need to do anything else — we will email you again when it is done.",
+      "Our team reviews every refund request by hand. The course is locked for you while they do, and your progress is kept as you left it. You do not need to do anything else — we will email you again when it is done.",
       "",
       "— The Cadence team",
     ].join("\n"),
@@ -99,7 +103,8 @@ export async function action({ params, request }: Route.ActionArgs) {
   const result = raiseRefundRequest(
     currentUserId,
     course.id,
-    parsed.data.reason
+    parsed.data.reason,
+    parsed.data.acknowledgeWarning === "on"
   );
 
   if (!result.raised) {
