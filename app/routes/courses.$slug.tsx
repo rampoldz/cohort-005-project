@@ -58,6 +58,7 @@ import {
 import { getAccess, LOCKED_MESSAGE } from "~/lib/access.server";
 import { MAX_RATING, MIN_RATING } from "~/lib/ratings";
 import { StarRating, StarRatingInput } from "~/components/star-rating";
+import { WithdrawRefundRequest } from "~/components/withdraw-refund-request";
 
 function getCourseBySlug(slug: string) {
   return db.select().from(courses).where(eq(courses.slug, slug)).get();
@@ -403,7 +404,12 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let refundOffer: { amount: number } | null = null;
   // Set while the course is Locked for this learner: which stage their Refund
   // Request is at, so the page can say why.
-  let lock: { refundApproved: boolean } | null = null;
+  // `openRefundRequestId` is the request the learner can still withdraw; it is
+  // null once the request is approved.
+  let lock: {
+    refundApproved: boolean;
+    openRefundRequestId: number | null;
+  } | null = null;
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
@@ -417,6 +423,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
         );
         lock = {
           refundApproved: lockingRequest?.status === RefundStatus.Approved,
+          openRefundRequestId:
+            lockingRequest?.status === RefundStatus.Open
+              ? lockingRequest.id
+              : null,
         };
       }
 
@@ -782,6 +792,8 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               ) : lock ? (
                 <CourseLocked
                   refundApproved={lock.refundApproved}
+                  openRefundRequestId={lock.openRefundRequestId}
+                  slug={course.slug}
                   progress={progress}
                 />
               ) : enrolled ? (
@@ -902,9 +914,14 @@ function RateCourse({ userRating }: { userRating: number | null }) {
  */
 function CourseLocked({
   refundApproved,
+  openRefundRequestId,
+  slug,
   progress,
 }: {
   refundApproved: boolean;
+  /** The request the learner can still withdraw; null once it is approved. */
+  openRefundRequestId: number | null;
+  slug: string;
   progress: number;
 }) {
   return (
@@ -921,8 +938,14 @@ function CourseLocked({
       <p className="text-muted-foreground">
         {refundApproved
           ? `Your progress (${progress}% complete) is kept until the refund is issued, and erased for good when it is.`
-          : `Your progress (${progress}% complete) is kept as you left it. If your refund request is declined, the course unlocks again.`}
+          : `Your progress (${progress}% complete) is kept as you left it. If you withdraw your refund request, or it is declined, the course unlocks again.`}
       </p>
+      {openRefundRequestId !== null && (
+        <WithdrawRefundRequest
+          courseSlug={slug}
+          refundRequestId={openRefundRequestId}
+        />
+      )}
       <Link to="/settings" className="inline-block underline">
         See your refund request
       </Link>

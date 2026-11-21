@@ -9,6 +9,7 @@ import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
 import {
   raiseRefundRequest,
+  withdrawRefundRequest,
   type RefundRefusalReason,
 } from "~/lib/refund-requests.server";
 
@@ -27,6 +28,10 @@ const refundActionSchema = z.object({
   acknowledgeWarning: z.string().optional(),
 });
 
+const withdrawActionSchema = z.object({
+  refundRequestId: z.coerce.number().int().positive(),
+});
+
 // How each reason a purchase can't be refunded is reported over HTTP. The
 // reasons themselves, and their wording, belong to the Refund Request module.
 const REFUSAL_STATUS: Record<RefundRefusalReason, number> = {
@@ -38,6 +43,8 @@ const REFUSAL_STATUS: Record<RefundRefusalReason, number> = {
   watched_too_much: 403,
   completed_too_much: 403,
   warning_not_acknowledged: 400,
+  request_not_found: 404,
+  request_not_open: 409,
 };
 
 function getCourseBySlug(slug: string) {
@@ -95,6 +102,32 @@ export async function action({ params, request }: Route.ActionArgs) {
   }
 
   const formData = await request.formData();
+
+  // The same address takes back an Open Refund Request. A refusal comes back
+  // as an error to show, not an error page: the page the learner is on is
+  // still right, and reloads with the request's real state.
+  if (formData.get("intent") === "withdraw") {
+    const withdrawal = parseFormData(formData, withdrawActionSchema);
+
+    if (!withdrawal.success) {
+      return data({ errors: withdrawal.errors }, { status: 400 });
+    }
+
+    const result = withdrawRefundRequest(
+      currentUserId,
+      withdrawal.data.refundRequestId
+    );
+
+    if (!result.withdrawn) {
+      return data(
+        { errors: { withdraw: result.message } },
+        { status: REFUSAL_STATUS[result.reason] }
+      );
+    }
+
+    return { withdrawn: true };
+  }
+
   const parsed = parseFormData(formData, refundActionSchema);
 
   if (!parsed.success) {

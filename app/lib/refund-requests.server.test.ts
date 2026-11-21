@@ -21,7 +21,9 @@ import {
   getRefundEligibility,
   markRefundIssued,
   isCourseLocked,
+  listLearnerRefundRequests,
   raiseRefundRequest,
+  withdrawRefundRequest,
 } from "./refund-requests.server";
 
 // Midday, so "days ago" never straddles midnight in any timezone the tests
@@ -82,6 +84,18 @@ function buyCourse(world: World, boughtAt: string = daysAgo(3)) {
     })
     .run();
   return purchase;
+}
+
+/** The learner raises a Refund Request on the course they already bought. */
+function raise(world: World) {
+  const result = raiseRefundRequest(
+    world.user.id,
+    world.course.id,
+    REASON,
+    true
+  );
+  if (!result.raised) throw new Error("The Refund Request was refused");
+  return result.refundRequest;
 }
 
 function completeLessons(world: World, count: number) {
@@ -337,14 +351,7 @@ describe("Refund Request module", () => {
     /** The learner buys the course and raises a Refund Request on it. */
     function raiseOpenRequest() {
       buyCourse(world);
-      const result = raiseRefundRequest(
-        world.user.id,
-        world.course.id,
-        REASON,
-        true
-      );
-      if (!result.raised) throw new Error("The Refund Request was refused");
-      return result.refundRequest;
+      return raise(world);
     }
 
     describe("declining", () => {
@@ -1446,6 +1453,152 @@ describe("Refund Request module", () => {
         raised: false,
         reason: "request_undecided",
       });
+    });
+  });
+
+  describe("withdrawing a Refund Request", () => {
+    it("unlocks the course when the learner withdraws their Open Refund Request", () => {
+      buyCourse(world);
+      const refundRequest = raise(world);
+
+      const result = withdrawRefundRequest(world.user.id, refundRequest.id);
+
+      expect(result).toMatchObject({
+        withdrawn: true,
+        refundRequest: { id: refundRequest.id, status: "withdrawn" },
+      });
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(false);
+    });
+
+    it("refuses anyone but the learner who raised it, and leaves the course Locked", () => {
+      buyCourse(world);
+      const refundRequest = raise(world);
+      const classmate = testDb
+        .insert(schema.users)
+        .values({
+          name: "Classmate",
+          email: "classmate@example.com",
+          role: schema.UserRole.Student,
+        })
+        .returning()
+        .get();
+
+      const result = withdrawRefundRequest(classmate.id, refundRequest.id);
+
+      expect(result).toEqual({
+        withdrawn: false,
+        reason: "request_not_found",
+        message: "We couldn't find that refund request.",
+      });
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+    });
+
+    it.each([
+      ["approved", schema.RefundStatus.Approved],
+      ["declined", schema.RefundStatus.Declined],
+      ["already withdrawn", schema.RefundStatus.Withdrawn],
+    ])("refuses to withdraw a Refund Request that is %s", (_label, status) => {
+      const purchase = buyCourse(world);
+      // Deciding a request belongs to the team; set the decided state up
+      // directly.
+      const refundRequest = testDb
+        .insert(schema.refunds)
+        .values({ purchaseId: purchase.id, reason: REASON, status })
+        .returning()
+        .get();
+
+      const result = withdrawRefundRequest(world.user.id, refundRequest.id);
+
+      expect(result).toEqual({
+        withdrawn: false,
+        reason: "request_not_open",
+        message: "Only an open refund request can be withdrawn.",
+      });
+    });
+
+    it("lets the learner raise a new Refund Request after withdrawing", () => {
+      buyCourse(world);
+      withdrawRefundRequest(world.user.id, raise(world).id);
+
+      const again = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        true
+      );
+
+      expect(again).toMatchObject({ raised: true, amount: 7900 });
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+    });
+
+    it("holds a new Refund Request after withdrawing to the usual limits", () => {
+      buyCourse(world, daysAgo(14));
+      withdrawRefundRequest(world.user.id, raise(world).id);
+
+      // The next day the 14-day window has closed.
+      vi.setSystemTime(new Date(2026, 5, 21, 12, 0, 0));
+
+      expect(
+        raiseRefundRequest(world.user.id, world.course.id, REASON, true)
+      ).toMatchObject({ raised: false, reason: "window_closed" });
+    });
+
+    it("leaves the learner's Progress exactly as it was", () => {
+      buyCourse(world);
+      completeLessons(world, 3);
+      watch(world, 0, 900);
+      const progressBefore = {
+        lessons: testDb.select().from(schema.lessonProgress).all(),
+        watched: testDb.select().from(schema.videoWatchEvents).all(),
+      };
+
+      withdrawRefundRequest(world.user.id, raise(world).id);
+
+      // The module has no interface onto Progress, so read the rows.
+      expect({
+        lessons: testDb.select().from(schema.lessonProgress).all(),
+        watched: testDb.select().from(schema.videoWatchEvents).all(),
+      }).toEqual(progressBefore);
+      expect(progressBefore.lessons).toHaveLength(3);
+    });
+
+    it("lists the learner's Refund Requests with their state, newest first", () => {
+      buyCourse(world);
+      const first = raise(world);
+      withdrawRefundRequest(world.user.id, first.id);
+      const second = raise(world);
+
+      expect(listLearnerRefundRequests(world.user.id)).toMatchObject([
+        {
+          id: second.id,
+          status: "open",
+          refundIssued: false,
+          courseTitle: "Test Course",
+          courseSlug: "test-course",
+          amountPaid: 7900,
+          reason: REASON,
+        },
+        { id: first.id, status: "withdrawn", refundIssued: false },
+      ]);
+      // Nobody else sees them.
+      expect(listLearnerRefundRequests(world.instructor.id)).toEqual([]);
+    });
+
+    it("keeps the course Locked when the learner tries to withdraw after approval", () => {
+      const purchase = buyCourse(world);
+      const refundRequest = testDb
+        .insert(schema.refunds)
+        .values({
+          purchaseId: purchase.id,
+          reason: REASON,
+          status: schema.RefundStatus.Approved,
+        })
+        .returning()
+        .get();
+
+      withdrawRefundRequest(world.user.id, refundRequest.id);
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
     });
   });
 });
