@@ -10,13 +10,16 @@ import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Label } from "~/components/ui/label";
 import { Textarea } from "~/components/ui/textarea";
-import { UserRole, RefundStatus, users } from "~/db/schema";
+import { UserRole, users } from "~/db/schema";
 import { AlertTriangle } from "lucide-react";
 import { data, isRouteErrorResponse, Link } from "react-router";
 import { db } from "~/db";
 import { eq } from "drizzle-orm";
 import { cn, formatPrice } from "~/lib/utils";
-import { listLearnerRefundRequests } from "~/lib/refund-requests.server";
+import {
+  listLearnerRefundRequests,
+  type RefundRequestState,
+} from "~/lib/refund-requests.server";
 import { WithdrawRefundRequest } from "~/components/withdraw-refund-request";
 
 // How each state of a Refund Request is shown to the learner who raised it.
@@ -26,31 +29,24 @@ const GREEN_BADGE =
   "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300";
 const MUTED_BADGE = "bg-muted text-muted-foreground";
 
-function describeRefundRequestState(
-  status: RefundStatus,
-  refundIssued: boolean
-): { label: string; badge: string; note: string | null } {
-  switch (status) {
-    case RefundStatus.Open:
-      return {
-        label: "Open",
-        badge: AMBER_BADGE,
-        note: "Our team is reviewing it. The course is locked until they decide or you withdraw it.",
-      };
-    case RefundStatus.Approved:
-      return refundIssued
-        ? { label: "Refund issued", badge: GREEN_BADGE, note: null }
-        : {
-            label: "Approved",
-            badge: GREEN_BADGE,
-            note: "Your refund is on its way. The course stays locked until it is issued.",
-          };
-    case RefundStatus.Declined:
-      return { label: "Declined", badge: MUTED_BADGE, note: null };
-    case RefundStatus.Withdrawn:
-      return { label: "Withdrawn", badge: MUTED_BADGE, note: null };
-  }
-}
+const REFUND_REQUEST_STATES: Record<
+  RefundRequestState,
+  { label: string; badge: string; note: string | null }
+> = {
+  open: {
+    label: "Open",
+    badge: AMBER_BADGE,
+    note: "Our team is reviewing it. The course is locked until they decide or you withdraw it.",
+  },
+  pending_refund: {
+    label: "Approved",
+    badge: GREEN_BADGE,
+    note: "Your refund is on its way. The course stays locked until it is issued.",
+  },
+  issued_refund: { label: "Refund issued", badge: GREEN_BADGE, note: null },
+  declined: { label: "Declined", badge: MUTED_BADGE, note: null },
+  withdrawn: { label: "Withdrawn", badge: MUTED_BADGE, note: null },
+};
 
 const settingsSchema = z.object({
   name: z.string().trim().min(1, "Name cannot be empty."),
@@ -134,7 +130,7 @@ export async function action({ request }: Route.ActionArgs) {
 export default function Settings({ loaderData }: Route.ComponentProps) {
   const { user, refundRequests } = loaderData;
   const openCount = refundRequests.filter(
-    (refundRequest) => refundRequest.status === RefundStatus.Open
+    (refundRequest) => refundRequest.state === "open"
   ).length;
   const fetcher = useFetcher();
   const nameInputRef = useRef<HTMLInputElement>(null);
@@ -236,10 +232,7 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
           </CardHeader>
           <CardContent className="space-y-4">
             {refundRequests.map((refundRequest) => {
-              const state = describeRefundRequestState(
-                refundRequest.status,
-                refundRequest.refundIssued
-              );
+              const state = REFUND_REQUEST_STATES[refundRequest.state];
 
               return (
                 <div key={refundRequest.id} className="rounded-md border p-3">
@@ -269,7 +262,7 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
                       {state.note}
                     </p>
                   )}
-                  {refundRequest.status === RefundStatus.Open && (
+                  {refundRequest.state === "open" && (
                     <div className="mt-3">
                       <WithdrawRefundRequest
                         courseSlug={refundRequest.courseSlug}

@@ -7,6 +7,7 @@ import { courses, users } from "~/db/schema";
 import { eq } from "drizzle-orm";
 import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
+import { sendEmail, type Email } from "~/lib/email.server";
 import {
   raiseRefundRequest,
   withdrawRefundRequest,
@@ -17,27 +18,31 @@ const refundParamsSchema = z.object({
   slug: z.string().min(1),
 });
 
-const refundActionSchema = z.object({
-  reason: z
-    .string()
-    .trim()
-    .min(10, "Tell us a little more about why you want a refund.")
-    .max(1000, "Please keep your reason under 1000 characters."),
-  // The checkbox under the warning. Absent when unticked; the Refund Request
-  // module is what refuses a request without it.
-  acknowledgeWarning: z.string().optional(),
-});
-
-const withdrawActionSchema = z.object({
-  refundRequestId: z.coerce.number().int().positive(),
-});
+// The same address raises a Refund Request and takes an Open one back.
+const refundActionSchema = z.discriminatedUnion("intent", [
+  z.object({
+    intent: z.literal("raise"),
+    reason: z
+      .string()
+      .trim()
+      .min(10, "Tell us a little more about why you want a refund.")
+      .max(1000, "Please keep your reason under 1000 characters."),
+    // The checkbox under the warning. Absent when unticked; the Refund Request
+    // module is what refuses a request without it.
+    acknowledgeWarning: z.string().optional(),
+  }),
+  z.object({
+    intent: z.literal("withdraw"),
+    refundRequestId: z.coerce.number().int().positive(),
+  }),
+]);
 
 // How each reason a purchase can't be refunded is reported over HTTP. The
 // reasons themselves, and their wording, belong to the Refund Request module.
 const REFUSAL_STATUS: Record<RefundRefusalReason, number> = {
   no_purchase: 403,
   final_purchase: 403,
-  request_undecided: 409,
+  request_in_progress: 409,
   already_refunded: 409,
   team_seat_claimed: 403,
   window_closed: 403,
@@ -52,16 +57,13 @@ function getCourseBySlug(slug: string) {
   return db.select().from(courses).where(eq(courses.slug, slug)).get();
 }
 
-/**
- * The confirmation the learner gets in their inbox. There is no mail
- * transport wired up yet, so the built message goes to the server log.
- */
+/** The confirmation the learner gets in their inbox. */
 function buildRefundRequestEmail(input: {
   learnerName: string;
   learnerEmail: string;
   courseTitle: string;
   amount: number;
-}) {
+}): Email {
   return {
     to: input.learnerEmail,
     subject: `Refund requested — ${input.courseTitle}`,
@@ -102,37 +104,28 @@ export async function action({ params, request }: Route.ActionArgs) {
     throw data("User not found", { status: 404 });
   }
 
-  const formData = await request.formData();
+  const parsed = parseFormData(await request.formData(), refundActionSchema);
 
-  // The same address takes back an Open Refund Request. A refusal comes back
-  // as an error to show, not an error page: the page the learner is on is
-  // still right, and reloads with the request's real state.
-  if (formData.get("intent") === "withdraw") {
-    const withdrawal = parseFormData(formData, withdrawActionSchema);
+  if (!parsed.success) {
+    const firstError = Object.values(parsed.errors)[0];
+    throw data(firstError ?? "That refund request could not be read.", {
+      status: 400,
+    });
+  }
 
-    if (!withdrawal.success) {
-      return data({ errors: withdrawal.errors }, { status: 400 });
-    }
-
-    const result = withdrawRefundRequest(
+  if (parsed.data.intent === "withdraw") {
+    const withdrawal = withdrawRefundRequest(
       currentUserId,
-      withdrawal.data.refundRequestId
+      parsed.data.refundRequestId
     );
 
-    if (!result.withdrawn) {
-      return data(
-        { errors: { withdraw: result.message } },
-        { status: REFUSAL_STATUS[result.reason] }
-      );
+    if (!withdrawal.withdrawn) {
+      throw data(withdrawal.message, {
+        status: REFUSAL_STATUS[withdrawal.reason],
+      });
     }
 
     return { withdrawn: true };
-  }
-
-  const parsed = parseFormData(formData, refundActionSchema);
-
-  if (!parsed.success) {
-    return data({ errors: parsed.errors }, { status: 400 });
   }
 
   const result = raiseRefundRequest(
@@ -146,15 +139,13 @@ export async function action({ params, request }: Route.ActionArgs) {
     throw data(result.message, { status: REFUSAL_STATUS[result.reason] });
   }
 
-  const email = buildRefundRequestEmail({
-    learnerName: learner.name,
-    learnerEmail: learner.email,
-    courseTitle: course.title,
-    amount: result.amount,
-  });
-
-  console.log(
-    `[email] to=${email.to} subject=${email.subject}\n${email.body}`
+  sendEmail(
+    buildRefundRequestEmail({
+      learnerName: learner.name,
+      learnerEmail: learner.email,
+      courseTitle: course.title,
+      amount: result.amount,
+    })
   );
 
   return redirect("/settings");

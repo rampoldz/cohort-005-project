@@ -27,7 +27,6 @@ import { getAccess, requireContentAccess } from "./access.server";
 import {
   approveRefundRequest,
   declineRefundRequest,
-  getLockingRefundRequest,
   markRefundIssued,
   raiseRefundRequest,
   withdrawRefundRequest,
@@ -78,6 +77,36 @@ function buyCourse(
     testDb.insert(schema.enrollments).values({ userId, courseId }).run();
   }
   return purchase;
+}
+
+/** The learner buys team seats for other people: no enrollment of their own. */
+function buyTeamSeats(
+  userId: number,
+  courseId: number,
+  values: Partial<typeof schema.purchases.$inferInsert> = {}
+) {
+  const teamPurchase = testDb
+    .insert(schema.purchases)
+    .values({
+      userId,
+      courseId,
+      amountPaid: 23700,
+      createdAt: NOW.toISOString(),
+      ...values,
+    })
+    .returning()
+    .get();
+  const team = testDb.insert(schema.teams).values({}).returning().get();
+  testDb
+    .insert(schema.coupons)
+    .values({
+      teamId: team.id,
+      courseId,
+      code: `TEAM-SEAT-${teamPurchase.id}`,
+      purchaseId: teamPurchase.id,
+    })
+    .run();
+  return teamPurchase;
 }
 
 function addCourse(world: World, slug: string) {
@@ -131,9 +160,34 @@ describe("getAccess", () => {
   });
 
   describe("once the learner raises a Refund Request", () => {
+    let refundRequestId: number;
+
     beforeEach(() => {
       buyCourse(world.user.id, world.course.id);
-      raiseRefundRequest(world.user.id, world.course.id, REASON, true);
+      const raised = raiseRefundRequest(
+        world.user.id,
+        world.course.id,
+        REASON,
+        true
+      );
+      if (!raised.raised) throw new Error("The Refund Request was refused");
+      refundRequestId = raised.refundRequest.id;
+    });
+
+    it("stays Locked when the learner then buys team seats for the course", async () => {
+      buyTeamSeats(world.user.id, world.course.id);
+      signInAs(world.user.id);
+
+      const access = await getAccess(makeRequest(), world.course.id);
+
+      expect(access).toMatchObject({
+        enrolled: true,
+        locked: true,
+        canViewContent: false,
+      });
+      await expect(
+        requireContentAccess(makeRequest(), world.course.id)
+      ).rejects.toMatchObject({ init: { status: 403 } });
     });
 
     it("reports the course as Locked and not viewable for that learner", async () => {
@@ -192,11 +246,7 @@ describe("getAccess", () => {
     });
 
     it("makes the course viewable again, still enrolled, once the learner withdraws", async () => {
-      const refundRequest = getLockingRefundRequest(
-        world.user.id,
-        world.course.id
-      )!;
-      withdrawRefundRequest(world.user.id, refundRequest.id);
+      withdrawRefundRequest(world.user.id, refundRequestId);
       signInAs(world.user.id);
 
       const access = await getAccess(makeRequest(), world.course.id);
@@ -213,11 +263,7 @@ describe("getAccess", () => {
     });
 
     it("stays Locked when someone else tries to withdraw the learner's Refund Request", async () => {
-      const refundRequest = getLockingRefundRequest(
-        world.user.id,
-        world.course.id
-      )!;
-      withdrawRefundRequest(world.instructor.id, refundRequest.id);
+      withdrawRefundRequest(world.instructor.id, refundRequestId);
       signInAs(world.user.id);
 
       const access = await getAccess(makeRequest(), world.course.id);
@@ -476,6 +522,26 @@ describe("getAccess", () => {
     expect(access).toMatchObject({ locked: true, canViewContent: false });
   });
 
+  it("keeps the course Locked when a learner with a Pending Refund buys team seats for it", async () => {
+    const purchase = buyCourse(world.user.id, world.course.id);
+    testDb
+      .insert(schema.refunds)
+      .values({
+        purchaseId: purchase.id,
+        reason: REASON,
+        status: schema.RefundStatus.Approved,
+        amountRefunded: 7900,
+        resolvedAt: daysAgo(1),
+      })
+      .run();
+    buyTeamSeats(world.user.id, world.course.id);
+    signInAs(world.user.id);
+
+    const access = await getAccess(makeRequest(), world.course.id);
+
+    expect(access).toMatchObject({ locked: true, canViewContent: false });
+  });
+
   it("does not lock an admin out of a course they asked to be refunded for", async () => {
     const admin = testDb
       .insert(schema.users)
@@ -519,5 +585,26 @@ describe("getAccess", () => {
     const access = await getAccess(makeRequest(), world.course.id);
 
     expect(access).toMatchObject({ pppBlocked: false, canViewContent: true });
+  });
+
+  it("checks the country of the learner's own purchase, not of team seats bought later", async () => {
+    testDb
+      .update(schema.courses)
+      .set({ price: 7900, pppEnabled: true })
+      .run();
+    // Bought their own place at a discount in India, then team seats at full
+    // price in the US.
+    buyCourse(world.user.id, world.course.id, { country: "IN" });
+    buyTeamSeats(world.user.id, world.course.id, { country: "US" });
+    signInAs(world.user.id);
+    mockSession.set("devCountry", "US");
+
+    const access = await getAccess(makeRequest(), world.course.id);
+
+    expect(access).toMatchObject({
+      enrolled: true,
+      pppBlocked: true,
+      canViewContent: false,
+    });
   });
 });

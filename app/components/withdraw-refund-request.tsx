@@ -6,7 +6,8 @@ import { Button } from "~/components/ui/button";
 /**
  * The learner's way to take back an Open Refund Request, which unlocks the
  * course at once. Show it only while the request is Open: there is no
- * withdrawing after approval.
+ * withdrawing after approval. A refused withdrawal is thrown by the action
+ * and lands on the error page, not here.
  */
 export function WithdrawRefundRequest({
   courseSlug,
@@ -15,19 +16,11 @@ export function WithdrawRefundRequest({
   courseSlug: string;
   refundRequestId: number;
 }) {
-  const fetcher = useFetcher<{
-    withdrawn?: boolean;
-    errors?: Record<string, string>;
-  }>();
+  const fetcher = useFetcher<{ withdrawn: true }>();
   const isSubmitting = fetcher.state !== "idle";
 
   useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) return;
-
-    const firstError = Object.values(fetcher.data.errors ?? {})[0];
-    if (firstError) {
-      toast.error(firstError);
-    } else if (fetcher.data.withdrawn) {
+    if (fetcher.state === "idle" && fetcher.data?.withdrawn) {
       toast.success("Refund request withdrawn. Your course is unlocked.");
     }
   }, [fetcher.state, fetcher.data]);

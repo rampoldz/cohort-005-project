@@ -6,7 +6,7 @@ import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
 import { checkPppAccess } from "~/lib/ppp";
 import {
-  getLatestPurchase,
+  getEnrollingPurchase,
   isCourseLocked,
 } from "~/lib/refund-requests.server";
 
@@ -109,7 +109,7 @@ export async function getAccess(
   };
 
   if (enrolled && !isStaff && course) {
-    const purchase = getLatestPurchase(userId, courseId);
+    const purchase = getEnrollingPurchase(userId, courseId);
     const currentCountry = await resolveCountry(request);
     ppp = checkPppAccess(
       course.price,

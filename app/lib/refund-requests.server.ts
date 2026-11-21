@@ -1,4 +1,17 @@
-import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import {
+  and,
+  desc,
+  eq,
+  exists,
+  getTableColumns,
+  inArray,
+  isNotNull,
+  isNull,
+  or,
+  sql,
+  type SQL,
+} from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import {
   comments,
@@ -42,11 +55,40 @@ const REFUND_COMPLETION_LIMIT = 0.5;
 
 export type RefundRequest = typeof refunds.$inferSelect;
 
+/**
+ * Where a Refund Request stands, in the glossary's terms. The stored status
+ * alone can't say: an Approved Refund Request is a Pending Refund until its
+ * Refund is marked as issued, and an Issued Refund after.
+ */
+export type RefundRequestState =
+  | "open"
+  | "withdrawn"
+  | "declined"
+  | "pending_refund"
+  | "issued_refund";
+
+export function getRefundRequestState(
+  refundRequest: Pick<RefundRequest, "status" | "issuedAt">
+): RefundRequestState {
+  switch (refundRequest.status) {
+    case RefundStatus.Open:
+      return "open";
+    case RefundStatus.Withdrawn:
+      return "withdrawn";
+    case RefundStatus.Declined:
+      return "declined";
+    case RefundStatus.Approved:
+      return refundRequest.issuedAt === null
+        ? "pending_refund"
+        : "issued_refund";
+  }
+}
+
 /** Why a purchase can't be refunded. */
 export type RefundRefusalReason =
   | "no_purchase"
   | "final_purchase"
-  | "request_undecided"
+  | "request_in_progress"
   | "already_refunded"
   | "team_seat_claimed"
   | "window_closed"
@@ -60,7 +102,7 @@ const REFUSAL_MESSAGES: Record<RefundRefusalReason, string> = {
   no_purchase: "You have not bought this course.",
   final_purchase:
     "You have already had a refund for this course, so this purchase is final and can't be refunded.",
-  request_undecided:
+  request_in_progress:
     "You already have a refund request on this purchase that is open or approved.",
   already_refunded: "This purchase has already been refunded.",
   team_seat_claimed: "A claimed team seat cannot be refunded.",
@@ -98,64 +140,48 @@ function refusal(reason: RefundRefusalReason): RefundRefusal {
   return { reason, message: REFUSAL_MESSAGES[reason] };
 }
 
+// A team purchase is one that team seats (coupons) were generated from. It
+// pays for other people's seats, not for the buyer's own place in the course.
+function isTeamPurchase() {
+  return exists(
+    db
+      .select({ id: coupons.id })
+      .from(coupons)
+      .where(eq(coupons.purchaseId, purchases.id))
+  );
+}
+
 /**
- * The learner's latest purchase of this course. A learner can have more than
- * one, and every refund rule — and the access resolver — reads the latest.
+ * The purchase the learner's own enrollment in this course rests on: their
+ * latest purchase of it for themselves. A learner can have more than one
+ * purchase of a course, and every refund rule — and the access resolver —
+ * reads this one.
+ *
+ * Team seats bought for other people never take its place, however recently
+ * they were bought, so buying seats can't unlock a Locked course, restart the
+ * refund window or change the amount. Only a learner who has bought nothing
+ * but team seats has a team purchase answer here.
  */
-export function getLatestPurchase(userId: number, courseId: number) {
+export function getEnrollingPurchase(userId: number, courseId: number) {
   return db
-    .select()
+    .select(getTableColumns(purchases))
     .from(purchases)
     .where(and(eq(purchases.userId, userId), eq(purchases.courseId, courseId)))
-    .orderBy(desc(purchases.createdAt), desc(purchases.id))
-    .get();
-}
-
-/**
- * The Refund Request that has this course Locked for the learner, or null
- * when it isn't Locked. Locked is derived, never stored: the learner's latest
- * purchase has a Refund Request that is Open, or approved with the Refund not
- * yet issued (a Pending Refund).
- */
-export function getLockingRefundRequest(
-  userId: number,
-  courseId: number
-): RefundRequest | null {
-  const purchase = getLatestPurchase(userId, courseId);
-  if (!purchase) return null;
-
-  const locking = db
-    .select()
-    .from(refunds)
-    .where(
-      and(
-        eq(refunds.purchaseId, purchase.id),
-        or(
-          eq(refunds.status, RefundStatus.Open),
-          and(
-            eq(refunds.status, RefundStatus.Approved),
-            isNull(refunds.issuedAt)
-          )
-        )
-      )
+    .orderBy(
+      sql`${isTeamPurchase()}`,
+      desc(purchases.createdAt),
+      desc(purchases.id)
     )
-    .orderBy(desc(refunds.id))
     .get();
-
-  return locking ?? null;
 }
 
-/** Is this course Locked for the learner? */
-export function isCourseLocked(userId: number, courseId: number): boolean {
-  return getLockingRefundRequest(userId, courseId) !== null;
-}
-
-// Only one Refund Request per purchase can be in play at once: an Open one,
-// or an approved one whose Refund hasn't been issued yet (a Pending Refund).
-// A Declined or Withdrawn request leaves the learner free to ask again.
-function hasUndecidedRefundRequest(purchaseId: number) {
-  const undecided = db
-    .select({ id: refunds.id })
+// A Refund Request is in progress while it is Open or a Pending Refund
+// (approved, Refund not yet issued). Only one per purchase can be in progress
+// at once, and that one is what has the course Locked. A Declined or Withdrawn
+// request leaves the learner free to ask again.
+function findRefundRequestInProgress(purchaseId: number): RefundRequest | null {
+  const inProgress = db
+    .select()
     .from(refunds)
     .where(
       and(
@@ -169,9 +195,31 @@ function hasUndecidedRefundRequest(purchaseId: number) {
         )
       )
     )
+    .orderBy(desc(refunds.id))
     .get();
 
-  return !!undecided;
+  return inProgress ?? null;
+}
+
+/**
+ * The Refund Request that has this course Locked for the learner, or null
+ * when it isn't Locked. Locked is derived, never stored: the purchase the
+ * learner's enrollment rests on has a Refund Request that is Open or a
+ * Pending Refund.
+ */
+export function getLockingRefundRequest(
+  userId: number,
+  courseId: number
+): RefundRequest | null {
+  const purchase = getEnrollingPurchase(userId, courseId);
+  if (!purchase) return null;
+
+  return findRefundRequestInProgress(purchase.id);
+}
+
+/** Is this course Locked for the learner? */
+export function isCourseLocked(userId: number, courseId: number): boolean {
+  return getLockingRefundRequest(userId, courseId) !== null;
 }
 
 // One Refund per purchase: once its Refund is issued, the purchase is spent.
@@ -226,8 +274,9 @@ export function isNextPurchaseFinal(userId: number, courseId: number): boolean {
 }
 
 // A Final Purchase is one made after the learner's Issued Refund for the same
-// course. Only ever asked of the learner's latest purchase, so any other
-// purchase of the course is an earlier one.
+// course. Only ever asked of the purchase the learner's enrollment rests on,
+// and an Issued Refund ends that enrollment, so an Issued Refund on any other
+// purchase of the course came before this one.
 function isFinalPurchase(purchase: typeof purchases.$inferSelect) {
   return hasIssuedRefundForCourse(
     purchase.userId,
@@ -264,8 +313,12 @@ function isWithinRefundWindow(purchasedAtIso: string) {
   return calendarDay(new Date()) <= calendarDay(lastDay);
 }
 
-function getCourseLessonIds(courseId: number): number[] {
-  return db
+function getCourseLessonIds(
+  courseId: number,
+  // Pass the transaction to read inside one.
+  database: Pick<typeof db, "select"> = db
+): number[] {
+  return database
     .select({ id: lessons.id })
     .from(lessons)
     .innerJoin(modules, eq(lessons.moduleId, modules.id))
@@ -315,14 +368,14 @@ function getCompletedLessonCount(userId: number, lessonIds: number[]) {
 }
 
 /**
- * Can the learner's latest purchase of this course be refunded, and if not,
- * why? The first rule that fails is the reason given.
+ * Can the purchase the learner's enrollment in this course rests on be
+ * refunded, and if not, why? The first rule that fails is the reason given.
  */
 export function getRefundEligibility(
   userId: number,
   courseId: number
 ): RefundEligibility {
-  const purchase = getLatestPurchase(userId, courseId);
+  const purchase = getEnrollingPurchase(userId, courseId);
 
   if (!purchase) {
     return { eligible: false, ...refusal("no_purchase") };
@@ -332,8 +385,8 @@ export function getRefundEligibility(
     return { eligible: false, ...refusal("final_purchase") };
   }
 
-  if (hasUndecidedRefundRequest(purchase.id)) {
-    return { eligible: false, ...refusal("request_undecided") };
+  if (findRefundRequestInProgress(purchase.id)) {
+    return { eligible: false, ...refusal("request_in_progress") };
   }
 
   if (hasIssuedRefund(purchase.id)) {
@@ -370,8 +423,8 @@ export function getRefundEligibility(
 }
 
 /**
- * Raises an Open Refund Request on the learner's latest purchase of this
- * course, or refuses with the reason the purchase can't be refunded. Raising
+ * Raises an Open Refund Request on the purchase the learner's enrollment in
+ * this course rests on, or refuses with the reason the purchase can't be refunded. Raising
  * it locks the course, so the learner must have confirmed the warning that
  * says so (`warningAcknowledged`).
  */
@@ -413,6 +466,7 @@ export function raiseRefundRequest(
 
 /** A Refund Request as the team sees it: who, which course, and how far in. */
 export type RefundRequestDetails = RefundRequest & {
+  state: RefundRequestState;
   learner: { id: number; name: string; email: string };
   course: { id: number; title: string; slug: string };
   /** What the learner paid — and so what the Refund is, if approved. */
@@ -462,37 +516,40 @@ export function canDecideRefundRequests(userId: number): boolean {
   return user?.role === UserRole.Admin;
 }
 
-function withDetails(
-  rows: {
-    refundRequest: RefundRequest;
-    purchase: typeof purchases.$inferSelect;
-  }[]
-): RefundRequestDetails[] {
-  return rows.map(({ refundRequest, purchase }) => {
-    const learner = db
-      .select({ id: users.id, name: users.name, email: users.email })
-      .from(users)
-      .where(eq(users.id, purchase.userId))
-      .get()!;
-    const course = db
-      .select({ id: courses.id, title: courses.title, slug: courses.slug })
-      .from(courses)
-      .where(eq(courses.id, purchase.courseId))
-      .get()!;
-    const resolvedBy = refundRequest.resolvedByUserId
-      ? (db
-          .select({ id: users.id, name: users.name })
-          .from(users)
-          .where(eq(users.id, refundRequest.resolvedByUserId))
-          .get() ?? null)
-      : null;
-    const lessonIds = getCourseLessonIds(course.id);
+// Refund Requests matching `filter` (all of them without one), newest first,
+// each with its learner, course, deciding admin and how far in the learner is.
+function findRefundRequestDetails(filter?: SQL): RefundRequestDetails[] {
+  const resolvers = alias(users, "resolvers");
+  const rows = db
+    .select({
+      refundRequest: refunds,
+      amountPaid: purchases.amountPaid,
+      learner: { id: users.id, name: users.name, email: users.email },
+      course: { id: courses.id, title: courses.title, slug: courses.slug },
+      resolvedBy: { id: resolvers.id, name: resolvers.name },
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(resolvers, eq(refunds.resolvedByUserId, resolvers.id))
+    .where(filter)
+    .orderBy(desc(refunds.requestedAt), desc(refunds.id))
+    .all();
+
+  const lessonIdsByCourse = new Map<number, number[]>();
+
+  return rows.map(({ refundRequest, amountPaid, learner, course, resolvedBy }) => {
+    const lessonIds =
+      lessonIdsByCourse.get(course.id) ?? getCourseLessonIds(course.id);
+    lessonIdsByCourse.set(course.id, lessonIds);
 
     return {
       ...refundRequest,
+      state: getRefundRequestState(refundRequest),
       learner,
       course,
-      amountPaid: purchase.amountPaid,
+      amountPaid,
       resolvedBy,
       lessonsCompleted: getCompletedLessonCount(learner.id, lessonIds),
       lessonCount: lessonIds.length,
@@ -504,14 +561,7 @@ function withDetails(
 function getRefundRequestDetails(
   refundRequestId: number
 ): RefundRequestDetails | null {
-  const rows = db
-    .select({ refundRequest: refunds, purchase: purchases })
-    .from(refunds)
-    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
-    .where(eq(refunds.id, refundRequestId))
-    .all();
-
-  return withDetails(rows)[0] ?? null;
+  return findRefundRequestDetails(eq(refunds.id, refundRequestId))[0] ?? null;
 }
 
 function decideRefundRequest(
@@ -546,10 +596,10 @@ function decideRefundRequest(
 
   if (!decided) return decisionRefusal("request_not_open");
 
-  return {
-    decided: true,
-    refundRequest: getRefundRequestDetails(refundRequestId)!,
-  };
+  const refundRequest = getRefundRequestDetails(refundRequestId);
+  if (!refundRequest) return decisionRefusal("request_not_found");
+
+  return { decided: true, refundRequest };
 }
 
 /**
@@ -633,13 +683,7 @@ function eraseProgress(tx: Transaction, userId: number, courseId: number) {
     )
     .run();
 
-  const lessonIds = tx
-    .select({ id: lessons.id })
-    .from(lessons)
-    .innerJoin(modules, eq(lessons.moduleId, modules.id))
-    .where(eq(modules.courseId, courseId))
-    .all()
-    .map((row) => row.id);
+  const lessonIds = getCourseLessonIds(courseId, tx);
   if (lessonIds.length === 0) return;
 
   tx.delete(lessonProgress)
@@ -750,10 +794,10 @@ export function markRefundIssued(
 
   if (!issued) return issueRefusal("refund_already_issued");
 
-  return {
-    issued: true,
-    refundRequest: getRefundRequestDetails(refundRequestId)!,
-  };
+  const refundRequest = getRefundRequestDetails(refundRequestId);
+  if (!refundRequest) return issueRefusal("request_not_found");
+
+  return { issued: true, refundRequest };
 }
 
 /**
@@ -761,14 +805,7 @@ export function markRefundIssued(
  * this with `canDecideRefundRequests`.
  */
 export function listRefundRequests(): RefundRequestDetails[] {
-  const rows = db
-    .select({ refundRequest: refunds, purchase: purchases })
-    .from(refunds)
-    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
-    .orderBy(desc(refunds.requestedAt), desc(refunds.id))
-    .all();
-
-  return withDetails(rows);
+  return findRefundRequestDetails();
 }
 
 // ─── The learner's own Refund Requests ───
@@ -786,19 +823,19 @@ export function withdrawRefundRequest(
   userId: number,
   refundRequestId: number
 ): WithdrawRefundRequestResult {
-  const own = db
+  const requestToWithdraw = db
     .select({ status: refunds.status })
     .from(refunds)
     .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
     .where(and(eq(refunds.id, refundRequestId), eq(purchases.userId, userId)))
     .get();
 
-  if (!own) {
+  if (!requestToWithdraw) {
     return { withdrawn: false, ...refusal("request_not_found") };
   }
 
   // No withdrawing once the team has decided, and nothing to withdraw twice.
-  if (own.status !== RefundStatus.Open) {
+  if (requestToWithdraw.status !== RefundStatus.Open) {
     return { withdrawn: false, ...refusal("request_not_open") };
   }
 
@@ -812,19 +849,29 @@ export function withdrawRefundRequest(
   return { withdrawn: true, refundRequest };
 }
 
+/** One of the learner's own Refund Requests, as their settings page lists it. */
+export type LearnerRefundRequest = {
+  id: number;
+  state: RefundRequestState;
+  reason: string;
+  requestedAt: string;
+  amountPaid: number;
+  courseTitle: string;
+  courseSlug: string;
+};
+
 /**
  * Every Refund Request the learner has raised, newest first, with what it was
- * for and the state it is in. `refundIssued` tells a Pending Refund (approved,
- * money not yet confirmed as sent) from an Issued Refund.
+ * for and the state it is in.
  */
-export function listLearnerRefundRequests(userId: number) {
+export function listLearnerRefundRequests(
+  userId: number
+): LearnerRefundRequest[] {
   return db
     .select({
       id: refunds.id,
       status: refunds.status,
-      refundIssued: sql<number>`${refunds.issuedAt} is not null`.mapWith(
-        Boolean
-      ),
+      issuedAt: refunds.issuedAt,
       reason: refunds.reason,
       requestedAt: refunds.requestedAt,
       amountPaid: purchases.amountPaid,
@@ -836,9 +883,9 @@ export function listLearnerRefundRequests(userId: number) {
     .innerJoin(courses, eq(purchases.courseId, courses.id))
     .where(eq(purchases.userId, userId))
     .orderBy(desc(refunds.requestedAt), desc(refunds.id))
-    .all();
+    .all()
+    .map(({ status, issuedAt, ...refundRequest }) => ({
+      ...refundRequest,
+      state: getRefundRequestState({ status, issuedAt }),
+    }));
 }
-
-export type LearnerRefundRequest = ReturnType<
-  typeof listLearnerRefundRequests
->[number];

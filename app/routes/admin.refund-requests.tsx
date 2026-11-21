@@ -6,7 +6,7 @@ import type { Route } from "./+types/admin.refund-requests";
 import { getCurrentUserId } from "~/lib/session";
 import { parseFormData } from "~/lib/validation";
 import { formatDuration, formatPrice } from "~/lib/utils";
-import { RefundStatus } from "~/db/schema";
+import { sendEmail, type Email } from "~/lib/email.server";
 import {
   approveRefundRequest,
   canDecideRefundRequests,
@@ -26,29 +26,24 @@ const refundDecisionActionSchema = z.object({
   refundRequestId: z.coerce.number().int(),
 });
 
-// How each reason a Refund Request can't be decided is reported over HTTP.
-// The reasons themselves, and their wording, belong to the Refund Request
-// module.
-const DECISION_REFUSAL_STATUS: Record<RefundDecisionRefusalReason, number> = {
+// How each reason the team's action on a Refund Request is refused is
+// reported over HTTP. The reasons themselves, and their wording, belong to the
+// Refund Request module.
+const REFUSAL_STATUS: Record<
+  RefundDecisionRefusalReason | MarkRefundIssuedRefusalReason,
+  number
+> = {
   not_admin: 403,
   request_not_found: 404,
   request_not_open: 409,
-};
-
-const ISSUE_REFUSAL_STATUS: Record<MarkRefundIssuedRefusalReason, number> = {
-  not_admin: 403,
-  request_not_found: 404,
   request_not_approved: 409,
   refund_already_issued: 409,
 };
 
-/**
- * The message the learner gets when their Refund Request is decided. There is
- * no mail transport wired up yet, so the built message goes to the server log.
- */
-function buildRefundDecisionEmail(refundRequest: RefundRequestDetails) {
+/** The message the learner gets when their Refund Request is decided. */
+function buildRefundDecisionEmail(refundRequest: RefundRequestDetails): Email {
   const { learner, course } = refundRequest;
-  const approved = refundRequest.status === RefundStatus.Approved;
+  const approved = refundRequest.state === "pending_refund";
 
   return {
     to: learner.email,
@@ -77,7 +72,7 @@ function buildRefundDecisionEmail(refundRequest: RefundRequestDetails) {
 }
 
 /** The message the learner gets when their Refund is issued. */
-function buildRefundIssuedEmail(refundRequest: RefundRequestDetails) {
+function buildRefundIssuedEmail(refundRequest: RefundRequestDetails): Email {
   const { learner, course } = refundRequest;
 
   return {
@@ -104,17 +99,6 @@ export function meta() {
   ];
 }
 
-/** Approved, with the money not yet confirmed as sent. */
-function isPendingRefund(refundRequest: {
-  status: RefundStatus;
-  issuedAt: string | null;
-}) {
-  return (
-    refundRequest.status === RefundStatus.Approved &&
-    refundRequest.issuedAt === null
-  );
-}
-
 export async function loader({ request }: Route.LoaderArgs) {
   const currentUserId = await getCurrentUserId(request);
 
@@ -132,14 +116,16 @@ export async function loader({ request }: Route.LoaderArgs) {
 
   return {
     openRefundRequests: refundRequests
-      .filter((refundRequest) => refundRequest.status === RefundStatus.Open)
+      .filter((refundRequest) => refundRequest.state === "open")
       // The team works through them oldest first.
       .reverse(),
-    pendingRefunds: refundRequests.filter(isPendingRefund).reverse(),
+    pendingRefunds: refundRequests
+      .filter((refundRequest) => refundRequest.state === "pending_refund")
+      .reverse(),
     pastRefundRequests: refundRequests.filter(
       (refundRequest) =>
-        refundRequest.status !== RefundStatus.Open &&
-        !isPendingRefund(refundRequest)
+        refundRequest.state !== "open" &&
+        refundRequest.state !== "pending_refund"
     ),
   };
 }
@@ -159,10 +145,9 @@ export async function action({ request }: Route.ActionArgs) {
   const parsed = parseFormData(formData, refundDecisionActionSchema);
 
   if (!parsed.success) {
-    return data(
-      { error: Object.values(parsed.errors)[0] ?? "Invalid input." },
-      { status: 400 }
-    );
+    throw data(Object.values(parsed.errors)[0] ?? "Invalid input.", {
+      status: 400,
+    });
   }
 
   const { intent, refundRequestId } = parsed.data;
@@ -171,19 +156,12 @@ export async function action({ request }: Route.ActionArgs) {
     const issued = markRefundIssued(refundRequestId, currentUserId);
 
     if (!issued.issued) {
-      return data(
-        { error: issued.message },
-        { status: ISSUE_REFUSAL_STATUS[issued.reason] }
-      );
+      throw data(issued.message, { status: REFUSAL_STATUS[issued.reason] });
     }
 
-    const email = buildRefundIssuedEmail(issued.refundRequest);
+    sendEmail(buildRefundIssuedEmail(issued.refundRequest));
 
-    console.log(
-      `[email] to=${email.to} subject=${email.subject}\n${email.body}`
-    );
-
-    return { success: true, message: "Refund marked as issued." };
+    return { message: "Refund marked as issued." };
   }
 
   const result =
@@ -192,20 +170,12 @@ export async function action({ request }: Route.ActionArgs) {
       : declineRefundRequest(refundRequestId, currentUserId);
 
   if (!result.decided) {
-    return data(
-      { error: result.message },
-      { status: DECISION_REFUSAL_STATUS[result.reason] }
-    );
+    throw data(result.message, { status: REFUSAL_STATUS[result.reason] });
   }
 
-  const email = buildRefundDecisionEmail(result.refundRequest);
-
-  console.log(
-    `[email] to=${email.to} subject=${email.subject}\n${email.body}`
-  );
+  sendEmail(buildRefundDecisionEmail(result.refundRequest));
 
   return {
-    success: true,
     message:
       intent === "approve"
         ? "Refund request approved."
@@ -251,10 +221,7 @@ function OpenRefundRequestRow({
   const isDeciding = fetcher.state !== "idle";
 
   useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) return;
-    if ("error" in fetcher.data) {
-      toast.error(fetcher.data.error);
-    } else {
+    if (fetcher.state === "idle" && fetcher.data) {
       toast.success(fetcher.data.message);
     }
   }, [fetcher.state, fetcher.data]);
@@ -328,10 +295,7 @@ function PendingRefundRow({
   const isMarking = fetcher.state !== "idle";
 
   useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) return;
-    if ("error" in fetcher.data) {
-      toast.error(fetcher.data.error);
-    } else {
+    if (fetcher.state === "idle" && fetcher.data) {
       toast.success(fetcher.data.message);
     }
   }, [fetcher.state, fetcher.data]);
@@ -377,16 +341,16 @@ function PendingRefundRow({
 }
 
 function outcomeOf(refundRequest: RefundRequestRow): string {
-  switch (refundRequest.status) {
-    case RefundStatus.Approved:
-      return refundRequest.issuedAt
-        ? `Approved — refund of ${formatPrice(refundRequest.amountRefunded)} issued`
-        : `Approved — refund of ${formatPrice(refundRequest.amountRefunded)} pending`;
-    case RefundStatus.Declined:
+  switch (refundRequest.state) {
+    case "issued_refund":
+      return `Approved — refund of ${formatPrice(refundRequest.amountRefunded)} issued`;
+    case "pending_refund":
+      return `Approved — refund of ${formatPrice(refundRequest.amountRefunded)} pending`;
+    case "declined":
       return "Declined — no refund";
-    case RefundStatus.Withdrawn:
+    case "withdrawn":
       return "Withdrawn by the learner";
-    default:
+    case "open":
       return "Open";
   }
 }
@@ -570,6 +534,9 @@ export default function AdminRefundRequests({
 export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
   let title = "Something went wrong";
   let message = "An unexpected error occurred while loading refund requests.";
+  // A refused approve, decline or mark-as-issued lands here too. The admin
+  // may still use the page, so offer the way back to it.
+  let canReturnToList = false;
 
   if (isRouteErrorResponse(error)) {
     if (error.status === 401) {
@@ -585,8 +552,12 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
           ? error.data
           : "Only admins can access this page.";
     } else {
-      title = `Error ${error.status}`;
+      title =
+        error.status === 409
+          ? "That can't be done any more"
+          : `Error ${error.status}`;
       message = typeof error.data === "string" ? error.data : error.statusText;
+      canReturnToList = true;
     }
   }
 
@@ -597,6 +568,11 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
         <h1 className="mb-2 text-2xl font-bold">{title}</h1>
         <p className="mb-6 text-muted-foreground">{message}</p>
         <div className="flex items-center justify-center gap-3">
+          {canReturnToList && (
+            <Link to="/admin/refund-requests" reloadDocument>
+              <Button variant="outline">Back to refund requests</Button>
+            </Link>
+          )}
           <Link to="/">
             <Button>Go Home</Button>
           </Link>

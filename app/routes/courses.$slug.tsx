@@ -15,7 +15,6 @@ import {
   lessonProgress,
   courseRatings,
   LessonProgressStatus,
-  RefundStatus,
 } from "~/db/schema";
 import { eq, and, or, sql } from "drizzle-orm";
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
@@ -54,6 +53,8 @@ import { parseFormData } from "~/lib/validation";
 import {
   getLockingRefundRequest,
   getRefundEligibility,
+  getRefundRequestState,
+  type RefundRequestState,
 } from "~/lib/refund-requests.server";
 import { getAccess, LOCKED_MESSAGE } from "~/lib/access.server";
 import { MAX_RATING, MIN_RATING } from "~/lib/ratings";
@@ -402,14 +403,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
   let refundOffer: { amount: number } | null = null;
-  // Set while the course is Locked for this learner: which stage their Refund
-  // Request is at, so the page can say why.
-  // `openRefundRequestId` is the request the learner can still withdraw; it is
-  // null once the request is approved.
-  let lock: {
-    refundApproved: boolean;
-    openRefundRequestId: number | null;
-  } | null = null;
+  // The Refund Request that has the course Locked for this learner, and the
+  // state it is in, so the page can say why. Null when the course isn't Locked.
+  let lockingRefundRequest: { id: number; state: RefundRequestState } | null =
+    null;
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
@@ -417,22 +414,16 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     if (enrolled) {
       const access = await getAccess(request, course.id);
       if (access.locked) {
-        const lockingRequest = getLockingRefundRequest(
-          currentUserId,
-          course.id
-        );
-        lock = {
-          refundApproved: lockingRequest?.status === RefundStatus.Approved,
-          openRefundRequestId:
-            lockingRequest?.status === RefundStatus.Open
-              ? lockingRequest.id
-              : null,
+        const refundRequest = getLockingRefundRequest(currentUserId, course.id);
+        lockingRefundRequest = refundRequest && {
+          id: refundRequest.id,
+          state: getRefundRequestState(refundRequest),
         };
       }
 
       const refundEligibility = getRefundEligibility(currentUserId, course.id);
       refundOffer =
-        refundEligibility.eligible && !lock
+        refundEligibility.eligible && !lockingRefundRequest
           ? { amount: refundEligibility.amount }
           : null;
 
@@ -479,7 +470,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ratingSummary,
     userRating,
     refundOffer,
-    lock,
+    lockingRefundRequest,
   };
 }
 
@@ -586,7 +577,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     ratingSummary,
     userRating,
     refundOffer,
-    lock,
+    lockingRefundRequest,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -774,7 +765,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               <h2 className="text-lg font-semibold">
                 {isInstructor
                   ? "Your Course"
-                  : lock
+                  : lockingRefundRequest
                     ? "Course Locked"
                     : enrolled
                       ? "Your Progress"
@@ -789,10 +780,12 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                     Manage Course
                   </Button>
                 </Link>
-              ) : lock ? (
+              ) : lockingRefundRequest ? (
                 <CourseLocked
-                  refundApproved={lock.refundApproved}
-                  openRefundRequestId={lock.openRefundRequestId}
+                  refundRequestId={lockingRefundRequest.id}
+                  isPendingRefund={
+                    lockingRefundRequest.state === "pending_refund"
+                  }
                   slug={course.slug}
                   progress={progress}
                 />
@@ -913,14 +906,17 @@ function RateCourse({ userRating }: { userRating: number | null }) {
  * Locked: why, and what happens next.
  */
 function CourseLocked({
-  refundApproved,
-  openRefundRequestId,
+  refundRequestId,
+  isPendingRefund,
   slug,
   progress,
 }: {
-  refundApproved: boolean;
-  /** The request the learner can still withdraw; null once it is approved. */
-  openRefundRequestId: number | null;
+  refundRequestId: number;
+  /**
+   * The Refund Request was approved and its Refund not yet issued. Otherwise
+   * it is Open, and the learner can still withdraw it.
+   */
+  isPendingRefund: boolean;
   slug: string;
   progress: number;
 }) {
@@ -931,19 +927,19 @@ function CourseLocked({
         <span>This course is locked for you</span>
       </div>
       <p className="text-muted-foreground">
-        {refundApproved
+        {isPendingRefund
           ? "Your refund request was approved and your refund is on its way. The course stays locked until the refund is issued."
           : "You asked for a refund on this course, so you can't open its lessons while our team reviews your refund request."}
       </p>
       <p className="text-muted-foreground">
-        {refundApproved
+        {isPendingRefund
           ? `Your progress (${progress}% complete) is kept until the refund is issued, and erased for good when it is.`
           : `Your progress (${progress}% complete) is kept as you left it. If you withdraw your refund request, or it is declined, the course unlocks again.`}
       </p>
-      {openRefundRequestId !== null && (
+      {!isPendingRefund && (
         <WithdrawRefundRequest
           courseSlug={slug}
-          refundRequestId={openRefundRequestId}
+          refundRequestId={refundRequestId}
         />
       )}
       <Link to="/settings" className="inline-block underline">
@@ -953,18 +949,13 @@ function CourseLocked({
   );
 }
 
+// A refused or unreadable request is thrown by the action and lands on the
+// error page, so there is no error state to show here.
 function RequestRefund({ slug, amount }: { slug: string; amount: number }) {
-  const fetcher = useFetcher<{ errors?: Record<string, string> }>();
+  const fetcher = useFetcher();
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [warningAcknowledged, setWarningAcknowledged] = useState(false);
   const isSubmitting = fetcher.state !== "idle";
-
-  useEffect(() => {
-    const firstError = Object.values(fetcher.data?.errors ?? {})[0];
-    if (fetcher.state === "idle" && firstError) {
-      toast.error(firstError);
-    }
-  }, [fetcher.state, fetcher.data]);
 
   if (!isFormOpen) {
     return (
@@ -993,10 +984,13 @@ function RequestRefund({ slug, amount }: { slug: string; amount: number }) {
         action={`/courses/${slug}/refund`}
         className="space-y-2"
       >
+        <input type="hidden" name="intent" value="raise" />
         <Textarea
           name="reason"
           rows={3}
           required
+          minLength={10}
+          maxLength={1000}
           placeholder="What went wrong?"
         />
         <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">

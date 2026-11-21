@@ -506,7 +506,7 @@ describe("Refund Request module", () => {
 
         expect(
           raiseRefundRequest(world.user.id, world.course.id, REASON, true)
-        ).toMatchObject({ raised: false, reason: "request_undecided" });
+        ).toMatchObject({ raised: false, reason: "request_in_progress" });
       });
 
       it("is refused to the course's instructor and to the learner", () => {
@@ -831,11 +831,13 @@ describe("Refund Request module", () => {
     }
 
     function getComment(commentId: number) {
-      return testDb
+      const comment = testDb
         .select()
         .from(schema.comments)
         .all()
-        .find((row) => row.id === commentId)!;
+        .find((row) => row.id === commentId);
+      if (!comment) throw new Error(`Comment ${commentId} is gone`);
+      return comment;
     }
 
     function ratingsOf(courseId: number) {
@@ -1386,7 +1388,7 @@ describe("Refund Request module", () => {
 
       expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
         eligible: false,
-        reason: "request_undecided",
+        reason: "request_in_progress",
         message:
           "You already have a refund request on this purchase that is open or approved.",
       });
@@ -1409,7 +1411,7 @@ describe("Refund Request module", () => {
         raiseRefundRequest(world.user.id, world.course.id, REASON, true)
       ).toEqual({
         raised: false,
-        reason: "request_undecided",
+        reason: "request_in_progress",
         message:
           "You already have a refund request on this purchase that is open or approved.",
       });
@@ -1514,7 +1516,7 @@ describe("Refund Request module", () => {
         message:
           "You have completed too much of this course to request a refund.",
       });
-      // Had a request been raised, the reason would now be "request_undecided".
+      // Had a request been raised, the reason would now be "request_in_progress".
       expect(getRefundEligibility(world.user.id, world.course.id)).toMatchObject(
         { reason: "completed_too_much" }
       );
@@ -1550,7 +1552,7 @@ describe("Refund Request module", () => {
 
       expect(second).toMatchObject({
         raised: false,
-        reason: "request_undecided",
+        reason: "request_in_progress",
       });
     });
   });
@@ -1670,14 +1672,13 @@ describe("Refund Request module", () => {
       expect(listLearnerRefundRequests(world.user.id)).toMatchObject([
         {
           id: second.id,
-          status: "open",
-          refundIssued: false,
+          state: "open",
           courseTitle: "Test Course",
           courseSlug: "test-course",
           amountPaid: 7900,
           reason: REASON,
         },
-        { id: first.id, status: "withdrawn", refundIssued: false },
+        { id: first.id, state: "withdrawn" },
       ]);
       // Nobody else sees them.
       expect(listLearnerRefundRequests(world.instructor.id)).toEqual([]);
@@ -1698,6 +1699,113 @@ describe("Refund Request module", () => {
       withdrawRefundRequest(world.user.id, refundRequest.id);
 
       expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+    });
+  });
+
+  describe("buying team seats after the learner's own purchase", () => {
+    /** The learner buys three team seats for the course, none claimed yet. */
+    function buyTeamSeats(boughtAt: string = NOW.toISOString()) {
+      const teamPurchase = testDb
+        .insert(schema.purchases)
+        .values({
+          userId: world.user.id,
+          courseId: world.course.id,
+          amountPaid: 23700,
+          createdAt: boughtAt,
+        })
+        .returning()
+        .get();
+      addTeamSeat(world, teamPurchase.id, false);
+      return teamPurchase;
+    }
+
+    function addAdmin() {
+      return testDb
+        .insert(schema.users)
+        .values({
+          name: "Ada Admin",
+          email: "ada@example.com",
+          role: schema.UserRole.Admin,
+        })
+        .returning()
+        .get();
+    }
+
+    it("keeps the course Locked while the learner's Refund Request is Open", () => {
+      buyCourse(world, daysAgo(3));
+      const refundRequest = raise(world);
+
+      buyTeamSeats();
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+      expect(
+        getLockingRefundRequest(world.user.id, world.course.id)
+      ).toMatchObject({ id: refundRequest.id });
+    });
+
+    it("keeps the course Locked while the learner has a Pending Refund", () => {
+      const admin = addAdmin();
+      buyCourse(world, daysAgo(3));
+      const refundRequest = raise(world);
+      approveRefundRequest(refundRequest.id, admin.id);
+
+      buyTeamSeats();
+
+      expect(isCourseLocked(world.user.id, world.course.id)).toBe(true);
+    });
+
+    it("still refuses a second Refund Request while the first is Open or a Pending Refund", () => {
+      const admin = addAdmin();
+      buyCourse(world, daysAgo(3));
+      const refundRequest = raise(world);
+      buyTeamSeats();
+
+      expect(
+        getRefundEligibility(world.user.id, world.course.id)
+      ).toMatchObject({ eligible: false, reason: "request_in_progress" });
+
+      approveRefundRequest(refundRequest.id, admin.id);
+
+      expect(
+        getRefundEligibility(world.user.id, world.course.id)
+      ).toMatchObject({ eligible: false, reason: "request_in_progress" });
+    });
+
+    it("offers the Refund on the learner's own purchase, for what they paid for it", () => {
+      const purchase = buyCourse(world, daysAgo(3));
+
+      buyTeamSeats();
+
+      expect(getRefundEligibility(world.user.id, world.course.id)).toEqual({
+        eligible: true,
+        purchaseId: purchase.id,
+        amount: 7900,
+      });
+    });
+
+    it("does not restart the 14-day window", () => {
+      buyCourse(world, daysAgo(15));
+
+      buyTeamSeats();
+
+      expect(
+        getRefundEligibility(world.user.id, world.course.id)
+      ).toMatchObject({ eligible: false, reason: "window_closed" });
+    });
+
+    it("leaves a Final Purchase final", () => {
+      const admin = addAdmin();
+      buyCourse(world, daysAgo(10));
+      const refundRequest = raise(world);
+      approveRefundRequest(refundRequest.id, admin.id);
+      markRefundIssued(refundRequest.id, admin.id);
+      buyCourse(world, daysAgo(2));
+
+      buyTeamSeats();
+
+      expect(
+        getRefundEligibility(world.user.id, world.course.id)
+      ).toMatchObject({ eligible: false, reason: "final_purchase" });
     });
   });
 });
