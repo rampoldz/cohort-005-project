@@ -2237,7 +2237,8 @@ This course is still in draft while the cluster examples are rewritten against t
     .returning()
     .all();
 
-  db.insert(schema.purchases)
+  const [emmaCourse2Purchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[0].id, // Emma — bought course 2 individually
       courseId: course2.id,
@@ -2245,7 +2246,8 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(40),
     })
-    .run();
+    .returning()
+    .all();
 
   db.insert(schema.purchases)
     .values({
@@ -2257,7 +2259,8 @@ This course is still in draft while the cluster examples are rewritten against t
     })
     .run();
 
-  db.insert(schema.purchases)
+  const [oliviaCourse1Purchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[2].id, // Olivia — bought course 1 individually
       courseId: course1.id,
@@ -2265,9 +2268,11 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(35),
     })
-    .run();
+    .returning()
+    .all();
 
-  db.insert(schema.purchases)
+  const [sophiaCourse1Purchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[4].id, // Sophia — bought course 1 individually
       courseId: course1.id,
@@ -2275,7 +2280,8 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(15),
     })
-    .run();
+    .returning()
+    .all();
 
   console.log(`Created ${countRows(schema.purchases)} individual purchases.`);
 
@@ -2782,6 +2788,80 @@ This course is still in draft while the cluster examples are rewritten against t
     .run();
 
   console.log("Created Liam's Refund Request.");
+
+  // ─── Refund Requests in every other state ───
+  // So the admin's refund requests page, and the learners' settings pages,
+  // have one of each to show beside Liam's Open one. Each was raised within
+  // fourteen days of its purchase, and decided by the admin.
+
+  // Pending Refund: approved, the money not yet sent. Introduction to
+  // TypeScript is Locked for Sophia, with her Progress still in place.
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: sophiaCourse1Purchase.id,
+      status: RefundStatus.Approved,
+      reason: "I don't have the time for this course that I thought I would.",
+      amountRefunded: sophiaCourse1Purchase.amountPaid,
+      requestedAt: daysAgo(6),
+      resolvedAt: daysAgo(5),
+      resolvedByUserId: admin.id,
+    })
+    .run();
+
+  // Declined: Olivia keeps the course, and her Progress, as they were.
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: oliviaCourse1Purchase.id,
+      status: RefundStatus.Declined,
+      reason: "The later modules were harder than I expected.",
+      requestedAt: daysAgo(24),
+      resolvedAt: daysAgo(22),
+      resolvedByUserId: admin.id,
+    })
+    .run();
+
+  // Withdrawn: Emma changed her mind before the team decided.
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: emmaCourse2Purchase.id,
+      status: RefundStatus.Withdrawn,
+      reason: "I thought this covered GraphQL as well as REST.",
+      requestedAt: daysAgo(36),
+    })
+    .run();
+
+  // Issued Refund: Yuki bought Design Systems and was refunded. Issuing ended
+  // her enrollment and erased her Progress, so only the purchase and the
+  // Refund Request remain. Buying it again would be her Final Purchase.
+  const yuki = studentByEmail("yuki.tanaka@student.dev");
+  const [yukiPurchase] = db
+    .insert(schema.purchases)
+    .values({
+      userId: yuki.id,
+      courseId: course3.id,
+      amountPaid: 3999,
+      country: null,
+      createdAt: daysAgo(12),
+    })
+    .returning()
+    .all();
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: yukiPurchase.id,
+      status: RefundStatus.Approved,
+      reason: "My employer already gives me access to this course.",
+      amountRefunded: yukiPurchase.amountPaid,
+      requestedAt: daysAgo(10),
+      resolvedAt: daysAgo(9),
+      resolvedByUserId: admin.id,
+      issuedAt: daysAgo(7),
+      issuedByUserId: admin.id,
+    })
+    .run();
+
+  console.log(
+    `Created ${countRows(schema.refunds)} Refund Requests, one in each state.`
+  );
 
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
