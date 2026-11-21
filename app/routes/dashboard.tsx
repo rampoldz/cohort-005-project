@@ -16,6 +16,8 @@ import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
 import { AlertTriangle, BookOpen, CheckCircle2, GraduationCap, PlayCircle } from "lucide-react";
 import { CourseImage } from "~/components/course-image";
+import { CourseLockedNotice } from "~/components/course-locked-notice";
+import { getAccess } from "~/lib/access.server";
 import { data, isRouteErrorResponse } from "react-router";
 
 function getUserEnrolledCourses(userId: number) {
@@ -199,6 +201,12 @@ export async function loader({ request }: Route.LoaderArgs) {
 
   const enrolledCourses = getUserEnrolledCourses(currentUserId);
 
+  const lockedCourseIds = new Set<number>();
+  for (const enrollment of enrolledCourses) {
+    const access = await getAccess(request, enrollment.courseId);
+    if (access.locked) lockedCourseIds.add(enrollment.courseId);
+  }
+
   const coursesWithProgress = enrolledCourses.map((enrollment) => {
     const progress = calculateProgress(currentUserId, enrollment.courseId, false);
     const completedLessons = getCompletedLessonCount(
@@ -219,13 +227,21 @@ export async function loader({ request }: Route.LoaderArgs) {
       totalLessons,
       nextLessonId: nextLesson?.id ?? null,
       isCompleted,
+      locked: lockedCourseIds.has(enrollment.courseId),
     };
   });
 
-  const completedCourses = coursesWithProgress.filter((c) => c.isCompleted);
-  const inProgressCourses = coursesWithProgress.filter((c) => !c.isCompleted);
+  // A Locked course can't be continued or reviewed, so it gets a list of its
+  // own, whatever the learner's Progress in it.
+  const lockedCourses = coursesWithProgress.filter((c) => c.locked);
+  const completedCourses = coursesWithProgress.filter(
+    (c) => !c.locked && c.isCompleted
+  );
+  const inProgressCourses = coursesWithProgress.filter(
+    (c) => !c.locked && !c.isCompleted
+  );
 
-  return { inProgressCourses, completedCourses };
+  return { inProgressCourses, completedCourses, lockedCourses };
 }
 
 function DashboardCardSkeleton() {
@@ -268,8 +284,9 @@ export function HydrateFallback() {
 }
 
 export default function Dashboard({ loaderData }: Route.ComponentProps) {
-  const { inProgressCourses, completedCourses } = loaderData;
-  const totalCourses = inProgressCourses.length + completedCourses.length;
+  const { inProgressCourses, completedCourses, lockedCourses } = loaderData;
+  const totalCourses =
+    inProgressCourses.length + completedCourses.length + lockedCourses.length;
 
   return (
     <div className="mx-auto max-w-7xl p-6 lg:p-8">
@@ -364,6 +381,51 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
                           </Button>
                         </Link>
                       )}
+                    </CardFooter>
+                  </Card>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Locked Courses */}
+          {lockedCourses.length > 0 && (
+            <section>
+              <h2 className="mb-4 text-xl font-semibold">Locked</h2>
+              <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                {lockedCourses.map((course) => (
+                  <Card key={course.enrollmentId} className="flex flex-col overflow-hidden pt-0">
+                    <Link to={`/courses/${course.courseSlug}`} className="aspect-video overflow-hidden">
+                      <CourseImage
+                        src={course.coverImageUrl}
+                        alt={course.courseTitle}
+                        className="h-full w-full object-cover transition-transform hover:scale-105"
+                      />
+                    </Link>
+                    <CardHeader>
+                      <Link
+                        to={`/courses/${course.courseSlug}`}
+                        className="text-lg font-semibold leading-tight hover:text-primary"
+                      >
+                        {course.courseTitle}
+                      </Link>
+                      <p className="line-clamp-2 text-sm text-muted-foreground">
+                        {course.courseDescription}
+                      </p>
+                    </CardHeader>
+                    <CardContent className="flex-1">
+                      <CourseLockedNotice />
+                    </CardContent>
+                    <CardFooter>
+                      <Link
+                        to={`/courses/${course.courseSlug}`}
+                        className="w-full"
+                      >
+                        <Button className="w-full" variant="outline">
+                          <BookOpen className="mr-2 size-4" />
+                          View Course
+                        </Button>
+                      </Link>
                     </CardFooter>
                   </Card>
                 ))}

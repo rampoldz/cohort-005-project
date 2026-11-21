@@ -1,6 +1,8 @@
 import { Link } from "react-router";
 import type { Route } from "./+types/courses.$slug.$moduleId";
 import { getCurrentUserId } from "~/lib/session";
+import { getAccess } from "~/lib/access.server";
+import { CourseLockedNotice } from "~/components/course-locked-notice";
 import { db } from "~/db";
 import {
   categories,
@@ -189,12 +191,16 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   const currentUserId = await getCurrentUserId(request);
 
   let enrolled = false;
+  // The course is Locked for this learner: they see what the module holds,
+  // like a visitor, with no Progress and no way into a lesson.
+  let locked = false;
   let lessonProgressMap: Record<number, string> = {};
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
+    locked = (await getAccess(request, course.id)).locked;
 
-    if (enrolled) {
+    if (enrolled && !locked) {
       const progressRecords = getLessonProgressForCourse(
         currentUserId,
         course.id
@@ -229,6 +235,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     },
     module: moduleWithLessons,
     enrolled,
+    locked,
     lessonProgressMap,
     moduleProgress,
     completedLessons,
@@ -269,13 +276,15 @@ export default function ModuleDetail({ loaderData }: Route.ComponentProps) {
   const {
     course,
     module: mod,
-    enrolled,
+    locked,
     lessonProgressMap,
     moduleProgress,
     completedLessons,
     totalLessons,
     totalDuration,
   } = loaderData;
+  // A Locked course is shown the way it is to someone who hasn't bought it.
+  const enrolled = loaderData.enrolled && !locked;
 
   return (
     <div className="mx-auto max-w-4xl p-6 lg:p-8">
@@ -306,6 +315,18 @@ export default function ModuleDetail({ loaderData }: Route.ComponentProps) {
           </span>
         )}
       </div>
+
+      {locked && (
+        <div className="mb-6 space-y-2">
+          <CourseLockedNotice />
+          <Link
+            to={`/courses/${course.slug}`}
+            className="inline-block text-sm underline"
+          >
+            See why on the course page
+          </Link>
+        </div>
+      )}
 
       {/* Progress bar for enrolled students */}
       {enrolled && totalLessons > 0 && (

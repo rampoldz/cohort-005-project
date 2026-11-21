@@ -25,6 +25,8 @@ import { formatPrice } from "~/lib/utils";
 import { resolveCountry } from "~/lib/country.server";
 import { calculatePppPrice } from "~/lib/ppp";
 import { StarRating } from "~/components/star-rating";
+import { CourseLockedNotice } from "~/components/course-locked-notice";
+import { getAccess } from "~/lib/access.server";
 
 function buildCourseQuery(
   search: string | null,
@@ -297,7 +299,7 @@ export async function loader({ request, url }: Route.LoaderArgs) {
   // Build a map of courseId -> progress for enrolled courses
   const progressMap = new Map<
     number,
-    { progress: number; completedLessons: number }
+    { progress: number; completedLessons: number; locked: boolean }
   >();
   if (currentUserId) {
     const enrollments = getUserEnrolledCourses(currentUserId);
@@ -305,6 +307,7 @@ export async function loader({ request, url }: Route.LoaderArgs) {
       progressMap.set(enrollment.courseId, {
         progress: calculateProgress(currentUserId, enrollment.courseId, false),
         completedLessons: getCompletedLessonCount(currentUserId, enrollment.courseId),
+        locked: (await getAccess(request, enrollment.courseId)).locked,
       });
     }
   }
@@ -322,6 +325,7 @@ export async function loader({ request, url }: Route.LoaderArgs) {
       lessonCount: getLessonCountForCourse(course.id),
       progress: userProgress?.progress ?? null,
       completedLessons: userProgress?.completedLessons ?? null,
+      locked: userProgress?.locked ?? false,
       pppPrice,
       ratingAverage: rating?.average ?? null,
       ratingCount: rating?.count ?? 0,
@@ -475,7 +479,11 @@ export default function CourseCatalog({ loaderData }: Route.ComponentProps) {
                     {course.description}
                   </p>
                 </CardContent>
-                {course.progress !== null && course.progress > 0 && (
+                {course.locked ? (
+                  <CardContent className="pt-0">
+                    <CourseLockedNotice />
+                  </CardContent>
+                ) : course.progress !== null && course.progress > 0 && (
                   <CardContent className="pt-0">
                     <div className="mb-1 flex items-center justify-between text-xs">
                       <span className="text-muted-foreground">
