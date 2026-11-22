@@ -79,7 +79,12 @@ if (process.env.KNOCK_SERVICE_TOKEN) {
 
 for (const person of PEOPLE) {
   for (const sample of samplesFor(person.role, person.isTeamAdmin)) {
-    const r = await triggerSample(person, sample);
+    // A freshly committed workflow takes a few seconds to become triggerable.
+    let r = await triggerSample(person, sample);
+    for (let i = 0; i < 10 && r.status === 404; i++) {
+      await new Promise((done) => setTimeout(done, 2000));
+      r = await triggerSample(person, sample);
+    }
     console.log(`${r.ok ? "sent" : `FAILED ${r.status} ${r.error}`}  -> ${person.name}: ${sample.body.slice(0, 60)}`);
     if (!r.ok) process.exit(1);
   }
