@@ -2,6 +2,11 @@ import { Outlet } from "react-router";
 import type { Route } from "./+types/layout.app";
 import { Sidebar } from "~/components/sidebar";
 import { DevUI } from "~/components/dev-ui";
+// PROTOTYPE (ticket #31): throwaway Notification surface variants.
+import {
+  PrototypeNotificationsProvider,
+  PrototypeSwitcher,
+} from "~/components/prototype-notifications";
 import { Toaster } from "sonner";
 import { getCurrentUserId, getDevCountry } from "~/lib/session";
 import { getCountryTierInfo, COUNTRIES } from "~/lib/ppp";
@@ -213,6 +218,10 @@ export async function loader({ request }: Route.LoaderArgs) {
     countryTierInfo,
     countries: COUNTRIES,
     isTeamAdmin: currentUserId ? isTeamAdmin(currentUserId) : false,
+    prototypeKnock: {
+      publicKey: process.env.KNOCK_PUBLIC_API_KEY ?? null,
+      feedId: process.env.KNOCK_FEED_CHANNEL_ID ?? null,
+    },
   };
 }
 
@@ -225,9 +234,14 @@ export default function AppLayout({ loaderData }: Route.ComponentProps) {
     countryTierInfo,
     countries,
     isTeamAdmin: userIsTeamAdmin,
+    prototypeKnock,
   } = loaderData;
 
   return (
+    <PrototypeNotificationsProvider
+      knockConfig={prototypeKnock}
+      userId={currentUser?.id ?? null}
+    >
     <div className="flex h-screen overflow-hidden">
       <Sidebar
         currentUser={currentUser}
@@ -245,6 +259,8 @@ export default function AppLayout({ loaderData }: Route.ComponentProps) {
         countries={countries}
       />
       <Toaster position="bottom-right" richColors closeButton />
+      <PrototypeSwitcher />
     </div>
+    </PrototypeNotificationsProvider>
   );
 }
